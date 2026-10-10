@@ -594,6 +594,161 @@ check('规则：非法字符被清理', () => !/[\\/:*?"<>|]/.test(Q.renameRules
         recycleFixture = null;
     }
 
+    /* ---------------- 配置版本历史与回滚 ---------------- */
+
+    {
+        Q.config.set('cfgHistory.auto', false);   // 先关自动快照，保证下面计数确定
+        Q.cfgHistory.persist([]);
+
+        const flat = Q.cfgHistory.flatten({ a: 1, b: { c: 2, d: { e: 3 } }, arr: [1, 2] });
+        check('配置展平：标量 + 两层嵌套 + 数组整体', () => expect(
+            flat.a === 1 && flat['b.c'] === 2 && flat['b.d.e'] === 3 && flat.arr === '[1,2]',
+            JSON.stringify(flat)));
+
+        const d1 = Q.cfgHistory.diff({ x: 1, y: 2 }, { x: 1, y: 3, z: 4 });
+        check('配置差异：识别「修改」与「新增」', () => expect(
+            d1.length === 2 && d1.some((r) => r.path === 'y' && r.before === 2 && r.after === 3) && d1.some((r) => r.path === 'z'),
+            JSON.stringify(d1)));
+        const d2 = Q.cfgHistory.diff({ x: 1 }, {});
+        check('配置差异：识别「删除」', () => expect(d2.length === 1 && d2[0].path === 'x' && d2[0].after === undefined, JSON.stringify(d2)));
+        check('配置无差异时返回空数组', () => Q.cfgHistory.diff({ a: 1, b: { c: 'x' } }, { a: 1, b: { c: 'x' } }).length === 0);
+
+        const r1 = Q.cfgHistory.push('manual', '第一版');
+        check('存档一版', () => expect(!!r1 && Q.cfgHistory.list().length === 1 && Q.cfgHistory.list()[0].note === '第一版',
+            `list=${Q.cfgHistory.list().length}`));
+        const r2 = Q.cfgHistory.push('manual', '重复内容');
+        check('内容相同不重复存档', () => expect(r2 === null && Q.cfgHistory.list().length === 1, `r2=${r2 === null ? 'null' : 'rec'}`));
+
+        Q.config.set('minInterval', 777);
+        const r3 = Q.cfgHistory.push('manual', '改了间隔');
+        check('变更后存档并记录差异处数', () => expect(!!r3 && r3.changes >= 1, `changes=${r3 && r3.changes}`));
+
+        const preHash = Q.cfgHistory.hashOf(Q.config.data);
+        const restorePromise = Q.cfgHistory.restore(r1.id);
+        const clickedRestore = await clickFoot('恢复');
+        const restored = await restorePromise;
+        check('回滚：恢复旧配置值', () => expect(restored === true && clickedRestore && Q.config.get('minInterval', 0) !== 777,
+            `restored=${restored} 点击=${clickedRestore} minInterval=${Q.config.get('minInterval', 0)}`));
+        check('回滚：恢复前状态仍可回退（已留档）', () => expect(
+            Q.cfgHistory.list().some((r) => r.hash === preHash),
+            `来源=${Q.cfgHistory.list().map((r) => r.reason).join(',')}`));
+
+        // 场景二：恢复前状态尚未被记录时，应自动补一版备份
+        Q.config.set('minInterval', 555);
+        const preHash2 = Q.cfgHistory.hashOf(Q.config.data);
+        const wasRecorded = Q.cfgHistory.list().some((r) => r.hash === preHash2);
+        const p2 = Q.cfgHistory.restore(r1.id);
+        const clicked2 = await clickFoot('恢复');
+        const ok2 = await p2;
+        check('回滚：未留档的状态会补一版备份', () => expect(
+            clicked2 && ok2 && Q.cfgHistory.list().some((r) => r.reason === 'backup' && r.hash === preHash2),
+            `已被记录=${wasRecorded} rebuilt=${Q.cfgHistory.list().some((r) => r.reason === 'backup')}`));
+
+        for (let i = 0; i < 25; i++) {
+            Q.config.set('minInterval', 100 + i);
+            Q.cfgHistory.push('manual', 'v' + i);
+        }
+        check('配置历史按上限裁剪', () => expect(Q.cfgHistory.list().length === Q.cfgHistory.MAX,
+            `实际 ${Q.cfgHistory.list().length}，上限 ${Q.cfgHistory.MAX}`));
+
+        Q.cfgHistory.persist([]);
+        Q.config.set('minInterval', 120);
+    }
+    {
+        // 自动快照：节流 + 去重 + 开关
+        Q.cfgHistory.persist([]);
+        Q.config.set('cfgHistory.auto', true);
+        Q.cfgHistory.lastAutoAt = 0;
+        Q.cfgHistory.autoSnapshot();
+        check('自动快照：开启后记录一版', () => expect(
+            Q.cfgHistory.list().length === 1 && Q.cfgHistory.list()[0].reason === 'auto',
+            `list=${Q.cfgHistory.list().length}`));
+
+        Q.cfgHistory.autoSnapshot();
+        check('自动快照：间隔内不重复记录', () => Q.cfgHistory.list().length === 1);
+
+        Q.cfgHistory.lastAutoAt = 0;
+        Q.cfgHistory.autoSnapshot();
+        check('自动快照：内容未变化不记录', () => Q.cfgHistory.list().length === 1);
+
+        Q.cfgHistory.lastAutoAt = Date.now();
+        Q.config.set('minInterval', 300);
+        check('自动快照：节流窗口内即使内容变化也不记录', () => expect(Q.cfgHistory.list().length === 1,
+            `list=${Q.cfgHistory.list().length}`));
+
+        Q.cfgHistory.lastAutoAt = 0;
+        Q.config.set('minInterval', 310);
+        check('自动快照：由配置变更回调触发', () => expect(Q.cfgHistory.list().length === 2,
+            `list=${Q.cfgHistory.list().length}`));
+
+        Q.config.set('cfgHistory.auto', false);
+        Q.cfgHistory.lastAutoAt = 0;
+        const n0 = Q.cfgHistory.list().length;
+        Q.config.set('minInterval', 320);
+        check('自动快照：关闭后不再记录', () => expect(Q.cfgHistory.list().length === n0, `list=${Q.cfgHistory.list().length}`));
+
+        Q.cfgHistory.persist([]);
+        Q.config.set('minInterval', 120);
+    }
+
+    /* ---------------- 统一删除入口 ---------------- */
+
+    {
+        Q.opLog.clear();
+        deleted.length = 0;
+        const n = await Q.deleteWithUndo([
+            { fid: 'f_a', name: '电影A.2024.1080p.mkv', size: 2147483648, pdir_fid: '0' },
+            { fid: 'f_b', name: '电影A·2024·1080p.mkv', size: 2147483648, pdir_fid: '0' },
+        ], { label: '测试删除' });
+        check('统一删除入口返回删除数量', () => expect(n === 2, `n=${n}`));
+        const rec = Q.opLog.latestUndoable();
+        check('统一删除入口登记回收站 fid（可撤销）', () => expect(
+            !!rec && rec.type === 'delete' && rec.label === '测试删除' && rec.entries.filter((e) => e.recycleFid).length === 2,
+            `rec=${rec && rec.type} 已登记=${rec && rec.entries.filter((e) => e.recycleFid).length}`));
+
+        const before = calls.length;
+        const n2 = await Q.deleteWithUndo([], {});
+        check('空列表直接返回 0 且不发请求', () => expect(n2 === 0 && calls.length === before, `n2=${n2} 新请求=${calls.length - before}`));
+
+        Q.opLog.clear();
+        deleted.length = 0;
+    }
+
+    /* ---------------- 空间占用聚合 ---------------- */
+
+    {
+        const files = [
+            { path: '根/A/x.mkv', size: 400, ext: 'mkv', category: 'video', dir: false },
+            { path: '根/A/y.mp4', size: 100, ext: 'mp4', category: 'video', dir: false },
+            { path: '根/B/z.jpg', size: 50, ext: 'jpg', category: 'image', dir: false },
+            { path: '根/loose.txt', size: 10, ext: 'txt', category: 'doc', dir: false },
+            { path: '根/noext', size: 5, ext: '', category: 'other', dir: false },
+        ];
+        const byFiles = Q.spaceReport.aggregate(files, 'files', 3);
+        check('聚合-单文件：按体积降序且受 TopN 限制', () => expect(
+            byFiles.length === 3 && byFiles[0].size === 400 && byFiles[1].size === 100,
+            byFiles.map((r) => r.size).join(',')));
+
+        const byExt = Q.spaceReport.aggregate(files, 'ext', 10);
+        check('聚合-扩展名：分组累加体积', () => expect(
+            byExt.find((r) => r.key === '.mkv').size === 400 && byExt.find((r) => r.key === '(无扩展名)').count === 1,
+            JSON.stringify(byExt)));
+        check('聚合-扩展名：按体积降序', () => expect(byExt[0].key === '.mkv', JSON.stringify(byExt.map((r) => r.key))));
+
+        const byCat = Q.spaceReport.aggregate(files, 'category', 10);
+        check('聚合-类型：视频合计 500 / 2 个', () => expect(
+            byCat.find((r) => r.key === '视频').size === 500 && byCat.find((r) => r.key === '视频').count === 2,
+            JSON.stringify(byCat)));
+
+        const byDir = Q.spaceReport.aggregate(files, 'topdir', 10);
+        check('聚合-一级子目录：A 合计 500', () => expect(
+            byDir.find((r) => r.key === 'A').size === 500, JSON.stringify(byDir)));
+        check('聚合-一级子目录：根目录散置文件单列', () => expect(
+            !!byDir.find((r) => r.key === '(根目录下散置文件)'), JSON.stringify(byDir.map((r) => r.key))));
+
+        check('聚合标签文案', () => Q.spaceReport.groupLabel('files', 3) === '最大的 3 个文件');
+    }
+
     /* ---------------- 结果 ---------------- */
     console.log(results.join('\n'));
     console.log('─'.repeat(56));

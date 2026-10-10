@@ -2,10 +2,10 @@
 // @name               夸克增强大师
 // @name:en            Quark Enhancement Master
 // @namespace          https://github.com/3ALLBUY14/quark-enhancement-master
-// @version            0.1.2
+// @version            0.1.3
 // @author             Quark port / 原版 PikPak Enhancement Master by digbug82
 // @license            AGPL-3.0-or-later
-// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
+// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
 // @description:en     Quark Drive enhancement: batch rename, file/folder dedup, cleanup, directory-tree export, M3U export, magnet extraction, file insight/filter, sorting, direct-link export with Aria2/IDM, PotPlayer launcher, batch share & share-import, recycle bin, reverse image search, config backup.
 // @homepage           https://github.com/3ALLBUY14/quark-enhancement-master
 // @match              https://pan.quark.cn/*
@@ -60,7 +60,7 @@
      * 0. 常量
      * ==================================================================== */
 
-    const VERSION = '0.1.2';
+    const VERSION = '0.1.3';
     const LS_CFG = 'qem_cfg_v1';
     const LS_CACHE_PREFIX = 'qem_cache_';
     const ROOT_FID = '0';
@@ -342,6 +342,7 @@
         breaker: { threshold: 6, cooldown: 30000 },   // 连续失败 N 次后熔断 T 毫秒
         capacityWarn: 0.95,              // 使用率超过该比例时预警
         trash: { retentionDays: 30, warnDays: 3, autoCheck: true },   // 回收站保留期与临期预警
+        cfgHistory: { auto: true },      // 配置变更自动留痕（5 分钟节流）
         downloader: 'aria2',         // aria2 | idm | abdm | none
         aria2: { rpc: 'http://127.0.0.1:6800/jsonrpc', secret: '', dir: '', autoStart: true },
         player: 'script',            // script | potplayer | other
@@ -548,6 +549,7 @@
         btnUndo: '撤销',
         btnHistory: '操作历史',
         btnSnapshot: '目录快照',
+        btnSpace: '空间分析',
         title_share_result: '分享成功',
         // 提示
         noSelection: '请先选择要操作的项目',
@@ -676,6 +678,12 @@
 .qem-drop { border: 1px dashed var(--qem-border); border-radius: 8px; padding: 10px; }
 .qem-scroll { overflow: auto; }
 .qem-mono { font-family: ui-monospace, Consolas, Menlo, monospace; font-size: 12px; }
+
+/* 排行条：.track 宽度表示占比，.val 显示数值 */
+.qem-rank { display: flex; align-items: center; gap: 8px; }
+.qem-rank .track { flex: 1; height: 8px; border-radius: 999px; background: var(--qem-bg-hover); overflow: hidden; min-width: 60px; }
+.qem-rank .track > i { display: block; height: 100%; background: var(--qem-accent); }
+.qem-rank .val { min-width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
 `;
 
     const ui = {
@@ -2356,6 +2364,472 @@ ${warn}
 
 
 
+    /* ======================================================================
+     * 6.9 统一删除入口
+     *     删除在 5 处被调用（工作台/清理/查重/透视/空间分析），此前各写一遍
+     *     「分片删除 + 登记回收站 fid + 记入撤销栈」，收敛为一个入口避免漏记。
+     * ==================================================================== */
+
+    /**
+     * @param {Array} items 待删除项（需含 fid / name / size / pdir_fid）
+     * @returns {Promise<number>} 实际提交删除的数量
+     */
+    async function deleteWithUndo(items, { label = '批量删除', onProgress = null } = {}) {
+        const list = (items || []).filter((i) => i && i.fid);
+        if (!list.length) return 0;
+
+        await api.removeChunked(list.map((i) => i.fid), 100, onProgress);
+
+        let entries = list.map((i) => ({ fid: i.fid, name: i.name, size: i.size, pdir: i.pdir_fid }));
+        let undoable = true;
+        let note = '';
+        try {
+            const pairs = await opLog.resolveRecycleFids(entries);
+            const map = new Map(pairs.map((x) => [x.fid, x.recycleFid]));
+            entries = entries.map((e) => ({ ...e, recycleFid: map.get(e.fid) }));
+            if (map.size < entries.length) {
+                undoable = map.size > 0;
+                note = `仅 ${map.size}/${entries.length} 项匹配到回收站条目（可能已超出保留期）`;
+            }
+        } catch (e) {
+            undoable = false;
+            note = '未能读取回收站，无法自动撤销，请到「回收站」手动还原';
+        }
+        opLog.push({ type: 'delete', label, entries, undoable, note });
+        capacityGuard.invalidate();
+        return list.length;
+    }
+
+    /* ======================================================================
+     * 6.10 配置版本历史与回滚
+     *      配置是唯一「误操作后无法自我恢复」的数据：改错一个开关、被导入
+     *      覆盖、误点重置，都没有退路。此处按版本留痕，并可一键回滚。
+     *      （云端配置同步需要上传管线，本版暂无，故做本地版本历史。）
+     * ==================================================================== */
+
+    const cfgKey = 'qem_cfg_history_v1';
+
+    const cfgHistory = {
+        MAX: 20,
+        AUTO_INTERVAL: 5 * 60 * 1000,   // 自动快照最短间隔
+        lastAutoAt: 0,
+        _suppress: false,               // 回滚过程中抑制自动快照，避免自激
+
+        list() {
+            try {
+                const raw = localStorage.getItem(cfgKey);
+                const arr = raw ? JSON.parse(raw) : [];
+                return Array.isArray(arr) ? arr : [];
+            } catch (e) { return []; }
+        },
+
+        persist(arr) {
+            const trimmed = arr.slice(0, this.MAX);
+            try { localStorage.setItem(cfgKey, JSON.stringify(trimmed)); return true; }
+            catch (e) { ui.toast('配置历史保存失败：本地存储不足，请清理历史', 'error', 5000); return false; }
+        },
+
+        hashOf(data) { return fnv(JSON.stringify(data)); },
+
+        /** 展平为 'a.b.c' → 标量；数组与超大对象按整体比较 */
+        flatten(obj, prefix = '', out = {}, depth = 0) {
+            Object.keys(obj || {}).sort().forEach((k) => {
+                const v = obj[k];
+                const path = prefix ? `${prefix}.${k}` : k;
+                if (v && typeof v === 'object' && !Array.isArray(v) && depth < 2) {
+                    if (Object.keys(v).length > 24) out[path] = JSON.stringify(v);
+                    else this.flatten(v, path, out, depth + 1);
+                } else {
+                    out[path] = v && typeof v === 'object' ? JSON.stringify(v) : v;
+                }
+            });
+            return out;
+        },
+
+        /** 键级差异 */
+        diff(oldData, newData) {
+            const A = this.flatten(oldData || {});
+            const B = this.flatten(newData || {});
+            const keys = Array.from(new Set(Object.keys(A).concat(Object.keys(B)))).sort();
+            const out = [];
+            keys.forEach((k) => {
+                const sa = A[k] === undefined ? '∅' : JSON.stringify(A[k]);
+                const sb = B[k] === undefined ? '∅' : JSON.stringify(B[k]);
+                if (sa !== sb) out.push({ path: k, before: A[k], after: B[k] });
+            });
+            return out;
+        },
+
+        /** 记录一版；内容与最新版相同则跳过 */
+        push(reason = 'auto', note = '') {
+            const data = util.clone(config.data);
+            const hash = this.hashOf(data);
+            const arr = this.list();
+            if (arr.length && arr[0].hash === hash) return null;
+            const rec = {
+                id: util.uuid(), at: Date.now(), reason, note,
+                hash, data, scriptVersion: VERSION,
+                changes: arr.length ? this.diff(arr[0].data, data).length : 0,
+            };
+            arr.unshift(rec);
+            return this.persist(arr) ? rec : null;
+        },
+
+        /** 由 config 变更回调触发（带节流） */
+        autoSnapshot() {
+            if (this._suppress) return;
+            if (!config.get('cfgHistory.auto', true)) return;
+            const now = Date.now();
+            if (now - this.lastAutoAt < this.AUTO_INTERVAL) return;
+            const arr = this.list();
+            if (arr.length && arr[0].hash === this.hashOf(config.data)) return;
+            this.lastAutoAt = now;
+            this.push('auto', '自动快照');
+        },
+
+        async saveCurrent() {
+            const note = await ui.prompt('为该版本添加备注（可留空）：', { value: '', placeholder: '例如：调好下载器参数' });
+            if (note === null) return;
+            const rec = this.push('manual', note || '手动存档');
+            ui.toast(rec ? '已保存当前配置为一版' : '配置与最新版相同，未重复保存');
+        },
+
+        async restore(id) {
+            const rec = this.list().find((r) => r.id === id);
+            if (!rec) return false;
+            const diff = this.diff(rec.data, config.data);
+            const ok = await ui.confirm(
+                `恢复到该版本？\n\n时间：${util.ts(rec.at)}\n来源：${this.reasonLabel(rec.reason)}\n备注：${rec.note || '(无)'}\n` +
+                `将覆盖当前 ${diff.length} 处配置差异。\n\n恢复前会确保当前配置已被留档（若已有相同记录则不重复留档），可再回退。`,
+                { okText: '恢复' },
+            );
+            if (!ok) return false;
+
+            this.push('backup', '恢复前自动备份');
+            this._suppress = true;
+            try {
+                config.data = config.merge(util.clone(DEFAULT_CONFIG), util.clone(rec.data));
+                config.save();
+                ui.applyTheme();
+            } finally { this._suppress = false; }
+            ui.toast('配置已恢复到该版本');
+            return true;
+        },
+
+        reasonLabel(r) {
+            return { auto: '自动快照', manual: '手动存档', backup: '恢复前备份' }[r] || r;
+        },
+
+        open() {
+            const p = ui.panel({
+                title: '配置版本历史',
+                size: 'lg',
+                buttons: [
+                    { label: '保存当前为版本', primary: true, onClick: async () => { await this.saveCurrent(); p.close(); this.open(); } },
+                    { label: t('close'), onClick: (a) => a.close() },
+                ],
+            });
+            const info = document.createElement('div');
+            info.className = 'muted';
+            const box = document.createElement('div');
+            box.style.marginTop = '10px';
+            p.body.append(info, box);
+
+            const arr = this.list();
+            if (!arr.length) {
+                info.textContent = '还没有配置版本记录。开启自动快照后配置变化会自动留痕；也可随时手动存档。';
+                box.innerHTML = '<div class="qem-empty">点击「保存当前为版本」建立第一个版本</div>';
+                return;
+            }
+            const nowDiff = this.diff(arr[0].data, config.data).length;
+            info.innerHTML = `共 <b>${arr.length}</b> 版（最多保留 ${this.MAX} 版）。` +
+                (nowDiff ? `最新记录与当前配置有 <b>${nowDiff}</b> 处差异。` : '当前配置与最新记录一致。') +
+                `　自动快照：${config.get('cfgHistory.auto', true) ? '已开启' : '已关闭'}`;
+
+            const rows = arr.map((r) => ({ ...r, timeText: util.ts(r.at), reasonText: this.reasonLabel(r.reason) }));
+            const tb = ui.table([
+                { key: 'timeText', label: '时间' },
+                { key: 'reasonText', label: '来源', render: (v) => `<span class="qem-tag">${util.escapeHtml(v)}</span>` },
+                { key: 'note', label: '备注', render: (v) => util.escapeHtml(v || '-') },
+                { key: 'changes', label: '相比上一版', align: 'right', render: (v) => v ? `${v} 处` : '-' },
+                { key: 'act', label: '操作', render: (v, r) => {
+                    const bar = document.createElement('div');
+                    bar.className = 'row';
+                    const mk = (label, fn, cls) => {
+                        const b = document.createElement('button');
+                        b.textContent = label;
+                        if (cls) b.className = cls;
+                        b.addEventListener('click', fn);
+                        bar.appendChild(b);
+                    };
+                    mk('对比当前', () => { p.close(); cfgHistory.showDiff(r, config.data, '当前配置'); });
+                    mk('恢复', async () => {
+                        const done = await cfgHistory.restore(r.id);
+                        if (done) { p.close(); cfgHistory.open(); }
+                    }, 'primary');
+                    mk('导出', () => {
+                        util.saveTextFile(`qem_config_v${new Date(r.at).toISOString().slice(0, 10)}_${r.id.slice(0, 6)}.json`,
+                            JSON.stringify({ __type: 'qem-config', version: r.scriptVersion, exportedAt: r.at, data: r.data }, null, 2),
+                            'application/json');
+                    });
+                    mk('删除', async () => {
+                        const ok = await ui.confirm('删除该版本记录？不影响当前配置。', { danger: true, okText: '删除' });
+                        if (!ok) return;
+                        cfgHistory.persist(cfgHistory.list().filter((x) => x.id !== r.id));
+                        p.close(); cfgHistory.open();
+                    }, 'danger');
+                    return bar;
+                } },
+            ], rows, { maxHeight: '52vh' });
+            box.appendChild(tb.el);
+
+            const acts = document.createElement('div');
+            acts.className = 'row';
+            acts.style.marginTop = '10px';
+            acts.style.flexWrap = 'wrap';
+            const auto = document.createElement('button');
+            auto.textContent = config.get('cfgHistory.auto', true) ? '关闭自动快照' : '开启自动快照';
+            auto.addEventListener('click', () => { config.set('cfgHistory.auto', !config.get('cfgHistory.auto', true)); p.close(); cfgHistory.open(); });
+            const clr = document.createElement('button');
+            clr.className = 'danger';
+            clr.textContent = '清空全部版本';
+            clr.addEventListener('click', async () => {
+                const ok = await ui.confirm(`清空全部 ${arr.length} 版配置记录？不影响当前配置。`, { danger: true, okText: '清空' });
+                if (!ok) return;
+                try { localStorage.removeItem(cfgKey); } catch (e) { /* 忽略 */ }
+                p.close(); cfgHistory.open();
+            });
+            acts.append(auto, clr);
+            box.appendChild(acts);
+        },
+
+        /** 键级差异面板 */
+        showDiff(fromRec, nowData, nowLabel) {
+            const diff = this.diff(fromRec.data, nowData);
+            const p = ui.panel({ title: '配置差异', size: 'md', buttons: [{ label: t('close'), onClick: (a) => a.close() }] });
+            const head = document.createElement('div');
+            head.className = 'col';
+            head.innerHTML = `<div class="muted">${util.escapeHtml(util.ts(fromRec.at))}（${util.escapeHtml(this.reasonLabel(fromRec.reason))}） →　${util.escapeHtml(nowLabel)}</div>` +
+                `<div>共 <b>${diff.length}</b> 处差异</div>`;
+            p.body.appendChild(head);
+            if (!diff.length) {
+                const d = document.createElement('div');
+                d.className = 'qem-empty';
+                d.textContent = '两边配置完全一致';
+                p.body.appendChild(d);
+                return;
+            }
+            const fmt = (v) => {
+                if (v === undefined) return '<span class="muted">（无）</span>';
+                const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+                return util.escapeHtml(s.length > 90 ? s.slice(0, 90) + '…' : s);
+            };
+            p.body.appendChild(ui.table([
+                { key: 'path', label: '配置项', render: (v) => `<span class="qem-mono">${util.escapeHtml(v)}</span>` },
+                { key: 'before', label: '原值', render: (v) => fmt(v) },
+                { key: 'after', label: '现值', render: (v) => fmt(v) },
+            ], diff, { maxHeight: '54vh' }).el);
+        },
+    };
+
+    // 配置每次落盘后触发一次自动快照（cfgHistory 内部有节流与去重）
+    config.onChange(() => cfgHistory.autoSnapshot());
+
+    /* ======================================================================
+     * 6.11 空间占用分析
+     * ==================================================================== */
+
+    const spaceReport = {
+        /** 按维度聚合（纯函数，便于单测）：files / ext / category / topdir */
+        aggregate(files, group, topN = 30) {
+            if (group === 'files') {
+                return files.slice().sort((a, b) => b.size - a.size).slice(0, topN)
+                    .map((f) => ({ key: f.path || f.name, size: f.size, count: 1, extra: f }));
+            }
+            const map = new Map();
+            files.forEach((f) => {
+                let k;
+                if (group === 'ext') k = f.ext ? '.' + f.ext : '(无扩展名)';
+                else if (group === 'category') k = (CATEGORY[f.category] || CATEGORY.other).label;
+                else {
+                    const rel = String(f.path || f.name).split('/').slice(1);   // 去掉根目录名
+                    k = rel.length > 1 ? rel[0] : '(根目录下散置文件)';
+                }
+                if (!map.has(k)) map.set(k, { key: k, size: 0, count: 0 });
+                const rec = map.get(k);
+                rec.size += f.size;
+                rec.count++;
+            });
+            return Array.from(map.values()).sort((a, b) => b.size - a.size).slice(0, topN);
+        },
+
+        groupLabel(group, n) {
+            if (group === 'files') return `最大的 ${n} 个文件`;
+            if (group === 'ext') return '按扩展名聚合';
+            if (group === 'category') return '按文件类型聚合';
+            return '按一级子目录聚合';
+        },
+
+        open() {
+            const p = ui.panel({ title: '空间占用分析', size: 'lg', buttons: [{ label: t('close'), onClick: (a) => a.close() }] });
+            const capBox = document.createElement('div');
+            capBox.className = 'drop';
+            capBox.innerHTML = '<div class="muted">正在读取容量...</div>';
+            const info = document.createElement('div');
+            info.className = 'muted';
+            info.style.margin = '8px 0';
+            const listBox = document.createElement('div');
+            p.body.append(capBox);
+
+            const form = ui.form([
+                { key: 'scope', label: '范围', type: 'select', value: 'deep', options: [
+                    { value: 'deep', label: '当前目录及子目录（推荐）' },
+                    { value: 'current', label: '仅当前目录' },
+                ] },
+                { key: 'group', label: '聚合维度', type: 'select', value: 'files', options: [
+                    { value: 'files', label: '单个文件 Top N' },
+                    { value: 'ext', label: '按扩展名' },
+                    { value: 'category', label: '按文件类型' },
+                    { value: 'topdir', label: '按一级子目录' },
+                ] },
+                { key: 'topN', label: 'Top N', type: 'select', value: '30', options: ['10', '20', '30', '50', '100'] },
+                { key: 'minSize', label: '忽略小于', value: '0', placeholder: '如 10MB，过滤碎片文件' },
+            ], () => run());
+            p.body.append(form.el, info, listBox);
+
+            async function run() {
+                const v = form.values;
+                info.textContent = t('working');
+                listBox.innerHTML = '';
+                let pool;
+                try {
+                    if (v.scope === 'deep') {
+                        const pr = ui.progress('扫描体积');
+                        try {
+                            pool = await scanner.walk(state.cwd, { onProgress: (n, path) => pr.set(0.5, `已扫描 ${n} 项 · ${path}`) });
+                        } finally { pr.close(); }
+                    } else {
+                        pool = state.items.map((i) => ({ ...i, path: i.name }));
+                    }
+                } catch (e) { info.textContent = '扫描失败：' + e.message; return; }
+
+                const min = parseSize(v.minSize);
+                const files = pool.filter((i) => !i.dir && i.size >= min);
+                const sum = scanner.summarize(pool);
+                const topN = Number(v.topN) || 30;
+
+                const rows = spaceReport.aggregate(files, v.group, topN);
+                const label = spaceReport.groupLabel(v.group, rows.length);
+
+                if (!rows.length) { info.textContent = '没有符合条件的文件'; return; }
+                const shown = rows.reduce((s, r) => s + r.size, 0);
+                const max = rows[0].size || 1;
+                info.innerHTML = `${label}　共 ${rows.length} 项，合计 <b>${util.humanSize(shown)}</b>` +
+                    `　|　本范围文件总量 <b>${util.humanSize(sum.size)}</b>（${sum.files} 个文件 / ${sum.folders} 个文件夹）` +
+                    (sum.size ? `，占比 ${(shown / sum.size * 100).toFixed(1)}%` : '');
+
+                const tb = ui.table([
+                    { key: 'key', label: v.group === 'files' ? '文件' : '分类', render: (val, row) => {
+                        const box = document.createElement('div');
+                        box.className = 'qem-rank';
+                        const name = document.createElement('span');
+                        name.className = 'grow ellipsis';
+                        name.textContent = val;
+                        name.title = val;
+                        const track = document.createElement('span');
+                        track.className = 'track';
+                        const bar = document.createElement('i');
+                        bar.style.width = Math.max(1, row.size / max * 100) + '%';
+                        track.appendChild(bar);
+                        const num = document.createElement('span');
+                        num.className = 'val';
+                        num.textContent = util.humanSize(row.size);
+                        box.append(name, track, num);
+                        return box;
+                    } },
+                    { key: 'count', label: v.group === 'files' ? '大小' : '文件数', align: 'right', render: (val, row) => v.group === 'files' ? util.humanSize(row.size) : `${row.count} 个` },
+                    { key: 'act', label: '操作', render: (val, row) => {
+                        const bar = document.createElement('div');
+                        bar.className = 'row';
+                        const b = document.createElement('button');
+                        b.textContent = '复制路径';
+                        b.addEventListener('click', () => util.copy(row.key, '已复制'));
+                        bar.appendChild(b);
+                        if (v.group === 'files' && row.extra) {
+                            const d = document.createElement('button');
+                            d.className = 'danger';
+                            d.textContent = '删除';
+                            d.addEventListener('click', async () => {
+                                const ok = await ui.confirm(`将「${row.key}」移入回收站（${util.humanSize(row.size)}）？\n删除后可通过「撤销」还原。`, { danger: true, okText: '移入回收站' });
+                                if (!ok) return;
+                                const pr = ui.progress('删除中');
+                                try {
+                                    await deleteWithUndo([row.extra], { label: '空间分析删除', onProgress: (d2, t2) => pr.set(d2 / t2, `已删除 ${d2}/${t2}`) });
+                                    pr.close();
+                                    ui.toast('已移入回收站，可通过 Alt+Z 撤销');
+                                    p.close(); spaceReport.open();
+                                    if (state.ui) await workspace.reload();
+                                } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
+                            });
+                            bar.appendChild(d);
+                        }
+                        return bar;
+                    } },
+                ], rows, { maxHeight: '44vh' });
+                listBox.innerHTML = '';
+                listBox.appendChild(tb.el);
+
+                const acts = document.createElement('div');
+                acts.className = 'row';
+                acts.style.marginTop = '10px';
+                acts.style.flexWrap = 'wrap';
+                const mk = (l2, fn, cls) => {
+                    const b = document.createElement('button');
+                    b.textContent = l2;
+                    if (cls) b.className = cls;
+                    b.addEventListener('click', fn);
+                    acts.appendChild(b);
+                };
+                mk('导出 CSV', () => exporter.saveCsv('空间占用', rows.map((r) => ({
+                    name: r.key, path: r.key, size: r.size, ext: '', dir: false, updated_at: 0, fid: r.extra ? r.extra.fid : '',
+                }))));
+                mk('复制清单', () => util.copy(rows.map((r) => `${util.humanSize(r.size)}\t${r.key}`).join('\n'), `已复制 ${rows.length} 条`));
+                if (v.group === 'files') {
+                    mk(`删除最大的 ${Math.min(10, rows.length)} 个文件`, async () => {
+                        const targets = rows.slice(0, 10).map((r) => r.extra).filter(Boolean);
+                        if (!targets.length) return;
+                        const total = targets.reduce((s, x) => s + x.size, 0);
+                        const ok = await ui.confirm(`将最大的 ${targets.length} 个文件移入回收站，合计 ${util.humanSize(total)}。\n删除后可通过「撤销」还原。是否继续？`, { danger: true, okText: '移入回收站' });
+                        if (!ok) return;
+                        const pr = ui.progress('删除中');
+                        try {
+                            const n = await deleteWithUndo(targets, { label: '空间分析批量删除', onProgress: (d2, t2) => pr.set(d2 / t2, `已删除 ${d2}/${t2}`) });
+                            pr.close();
+                            ui.toast(`已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
+                            p.close(); spaceReport.open();
+                            if (state.ui) await workspace.reload();
+                        } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
+                    }, 'danger');
+                }
+                p.body.appendChild(acts);
+            }
+
+            capacityGuard.summary().then((s) => {
+                if (!s) { capBox.innerHTML = '<div class="muted">容量读取失败（未登录或接口异常）</div>'; return; }
+                const pct = (s.pct * 100).toFixed(1);
+                capBox.innerHTML = `<div>网盘容量：已用 <b>${util.humanSize(s.used)}</b> / ${util.humanSize(s.total)}（${pct}%）　剩余 <b>${util.humanSize(s.remain)}</b></div>` +
+                    (s.pct >= Number(config.get('capacityWarn', 0.95))
+                        ? '<div class="qem-tag err" style="margin-top:6px">已超过容量预警阈值，建议先清理大文件</div>' : '');
+            });
+
+            run();
+        },
+    };
+
+    /* ======================================================================
+     * 7. 运行态（当前目录 / 选中项 / 剪贴板）
+     * ==================================================================== */
+
     const state = {
         cwd: ROOT_FID,
         path: [{ fid: ROOT_FID, name: '我的网盘' }],
@@ -2475,6 +2949,7 @@ ${warn}
                 mk('↩ ' + t('btnUndo'), () => workspace.undoLatest());
                 mk('🕘 ' + t('btnHistory'), () => opLog.open());
                 mk('🧾 ' + t('btnSnapshot'), () => snapshot.open());
+                mk('📊 ' + t('btnSpace'), () => spaceReport.open());
 
                 // 列表
                 listBox.innerHTML = '';
@@ -2631,28 +3106,9 @@ ${warn}
             if (!ok) return;
             const pr = ui.progress('删除中');
             try {
-                await api.removeChunked(items.map((i) => i.fid), 100, (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`));
-                // 记录回收站 fid，使删除可被撤销（回收站 fid 与源 fid 不一定一致，按名称+体积匹配）
-                pr.set(1, '正在登记撤销信息...');
-                let entries = items.map((i) => ({ fid: i.fid, name: i.name, size: i.size, pdir: i.pdir_fid }));
-                let undoable = true;
-                let note = '';
-                try {
-                    const pairs = await opLog.resolveRecycleFids(entries);
-                    const map = new Map(pairs.map((p) => [p.fid, p.recycleFid]));
-                    entries = entries.map((e) => ({ ...e, recycleFid: map.get(e.fid) }));
-                    if (map.size < entries.length) {
-                        undoable = map.size > 0;
-                        note = `仅 ${map.size}/${entries.length} 项匹配到回收站条目（回收站可能已超出保留范围）`;
-                    }
-                } catch (e) {
-                    undoable = false;
-                    note = '未能读取回收站，无法自动撤销，请到「回收站」手动还原';
-                }
-                opLog.push({ type: 'delete', entries, undoable, note });
-                capacityGuard.invalidate();
+                const n = await deleteWithUndo(items, { label: '批量删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`) });
                 pr.close();
-                ui.toast(`已移入回收站 ${items.length} 项`);
+                ui.toast(`已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
                 await workspace.reload();
             } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
         },
@@ -3002,8 +3458,8 @@ ${warn}
                     if (!ok) return;
                     const pr = ui.progress('删除中');
                     try {
-                        await api.removeChunked(matched.map((m) => m.fid), 100, (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`));
-                        pr.close(); ui.toast('已移入回收站');
+                        const n = await deleteWithUndo(matched, { label: '文件透视删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`) });
+                        pr.close(); ui.toast(`已移入回收站 ${n} 项`);
                         pool = null; await run(); await workspace.reload();
                     } catch (e) { pr.close(); ui.toast('失败：' + e.message, 'error'); }
                 }, 'danger');
@@ -3450,9 +3906,9 @@ ${warn}
                     if (!ok) return;
                     const pr = ui.progress('删除中');
                     try {
-                        const fids = groups.flatMap((g) => g.dupes.map((d) => d.fid));
-                        await api.removeChunked(fids, 100, (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`));
-                        pr.close(); ui.toast(`已清理 ${fids.length} 个冗余文件`);
+                        const dupes = groups.flatMap((g) => g.dupes);
+                        const n = await deleteWithUndo(dupes, { label: '查重清理', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`) });
+                        pr.close(); ui.toast(`已清理 ${n} 个冗余文件`);
                         await workspace.reload();
                     } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
                 });
@@ -3698,8 +4154,8 @@ ${warn}
                     if (!ok) return;
                     const pr3 = ui.progress('删除中');
                     try {
-                        await api.removeChunked(results.map((r) => r.fid), 100, (d, tt) => pr3.set(d / tt, `已删除 ${d}/${tt}`));
-                        pr3.close(); ui.toast(`已清理 ${results.length} 项`);
+                        const n = await deleteWithUndo(results, { label: '资源清理', onProgress: (d, tt) => pr3.set(d / tt, `已删除 ${d}/${tt}`) });
+                        pr3.close(); ui.toast(`已清理 ${n} 项`);
                         indexCache.dropAll();
                         await workspace.reload();
                     } catch (e) { pr3.close(); ui.toast('失败：' + e.message, 'error'); }
@@ -4853,6 +5309,8 @@ ${warn}
                         acts.appendChild(b);
                     };
                     mk('导出配置', () => { util.saveTextFile(`qem_config_${Date.now()}.json`, config.export(), 'application/json'); });
+                    mk('配置版本历史', () => { p.close(); cfgHistory.open(); });
+                    mk('空间占用分析', () => { p.close(); spaceReport.open(); });
                     mk('导入配置', () => {
                         const input = document.createElement('input');
                         input.type = 'file';
@@ -4881,7 +5339,7 @@ ${warn}
                     const info = document.createElement('div');
                     info.className = 'muted';
                     info.style.marginTop = '12px';
-                    info.textContent = '配置文件为纯 JSON，可跨设备导入；查重/目录树的全盘索引缓存为临时数据，可随时清理。';
+                    info.textContent = '配置文件为纯 JSON，可跨设备导入；配置每次改动会自动留痕（5 分钟节流，最多 20 版），可随时回滚。查重/目录树的全盘索引缓存为临时数据，可随时清理。';
                     body.appendChild(info);
                 }
 
@@ -5087,6 +5545,8 @@ ${warn}
             GM_registerMenuCommand('目录树导出', () => exporter.tree());
             GM_registerMenuCommand('解析分享链接', () => shareTool.parse());
             GM_registerMenuCommand('我的分享', () => shareTool.myList());
+            GM_registerMenuCommand('空间占用分析', () => spaceReport.open());
+            GM_registerMenuCommand('配置版本历史', () => cfgHistory.open());
             GM_registerMenuCommand('回收站', () => trash.open());
             GM_registerMenuCommand('设置', () => settings.open());
         } catch (e) { /* 部分管理器不支持，忽略 */ }
@@ -5130,7 +5590,7 @@ ${warn}
                 version: VERSION,
                 config, api, guard, breaker, EP, util, fileModel, scanner, indexCache, ui,
                 renameRules, parseSize, nameSimilarity,
-                opLog, conflict, capacityGuard, snapshot,
+                opLog, conflict, capacityGuard, snapshot, cfgHistory, spaceReport, deleteWithUndo,
                 workspace, dedup, cleanup, exporter, shareTool, trash, settings,
                 downloader, player, imgSearch, insight, preview, property, picker, state, sel,
             };
