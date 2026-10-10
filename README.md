@@ -2,9 +2,11 @@
 
 夸克网盘增强用户脚本。移植自 [PikPak Enhancement Master](https://github.com/digbug82/PikPak_Enhancement_Master) v5.3.0，保留其核心功能定位与交互范式（**工作台面板 → 多选 → 快捷键驱动的批量操作**），全部实现按夸克网盘接口重写。
 
-- 版本：v0.1.0
+- 版本：v0.1.2
 - 许可：AGPL-3.0-or-later（与原项目一致）
 - 产物：`Quark_Enhancement_Master.user.js`（单文件，直接安装）
+- 上游：[PikPak Enhancement Master](https://github.com/digbug82/PikPak_Enhancement_Master)（AGPL-3.0，衍生关系见 [NOTICE.md](NOTICE.md)）
+
 
 ## 安装
 
