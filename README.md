@@ -7,6 +7,8 @@
 - 产物：`Quark_Enhancement_Master.user.js`（单文件，直接安装）
 - 上游：[PikPak Enhancement Master](https://github.com/digbug82/PikPak_Enhancement_Master)（AGPL-3.0，衍生关系见 [NOTICE.md](NOTICE.md)）
 
+[![CI](https://github.com/3ALLBUY14/quark-enhancement-master/actions/workflows/ci.yml/badge.svg)](https://github.com/3ALLBUY14/quark-enhancement-master/actions/workflows/ci.yml)
+
 
 ## 安装
 
