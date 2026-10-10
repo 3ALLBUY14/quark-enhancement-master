@@ -1,0 +1,9 @@
+# 统一以 LF 入库，避免 Windows 提交带 CRLF 导致 CI 与 diff 噪音
+* text=auto eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary
