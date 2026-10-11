@@ -71,6 +71,8 @@ const TXT_BODY = '这是磁链合集\nmagnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAA
 const calls = [];
 let deleted = [];              // 模拟回收站：记录被删除的 fid
 let recycleFixture = null;     // 覆盖回收站返回（测试临期预警用）
+// 缩略图占位（脱敏：纯色 SVG，非真实素材）
+const THUMB_DATA = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2240%22 height=%2240%22%3E%3Crect width=%2240%22 height=%2240%22 fill=%22%230067c0%22/%3E%3C/svg%3E';
 const FLAT = {};
 Object.values(FILES).flat().forEach((f) => { FLAT[f.fid] = f; });
 
@@ -868,7 +870,121 @@ check('规则：非法字符被清理', () => !/[\\/:*?"<>|]/.test(Q.renameRules
             `added=${diff.added.length} moved=${diff.moved.length}`));
     }
 
+    /* ---------------- UI 设计系统（结构 + 样式表完整性） ---------------- */
+
+    {
+        // 从脚本源码抽取真实 UI_CSS，防止「JS 里加了类名但样式表漏写」这类静默失效
+        const srcText = fs.readFileSync(path.join(__dirname, '..', 'Quark_Enhancement_Master.user.js'), 'utf8');
+        const cssStart = srcText.indexOf('const UI_CSS = `');
+        const uiCss = cssStart < 0 ? '' : srcText.slice(cssStart + 16, srcText.indexOf('`;', cssStart));
+
+        const needClasses = [
+            'qem-scope', 'qem-dark', 'qem-fab', 'qem-mask', 'qem-panel', 'qem-head', 'qem-body', 'qem-foot',
+            'qem-tabs', 'qem-tab', 'qem-table', 'qem-tag', 'qem-bar', 'qem-toast', 'qem-toasts', 'qem-seg',
+            'qem-empty', 'qem-drop', 'qem-scroll', 'qem-mono', 'qem-rank', 'qem-thumb',
+            'qem-crumb', 'qem-toolbar', 'qem-sep', 'qem-content',
+            'd-compact', 'd-normal', 'd-loose',
+            'qem-lg', 'qem-md', 'qem-sm',
+        ];
+        const missing = needClasses.filter((c) => !uiCss.includes('.' + c));
+        check('样式表覆盖全部关键类名（防漏写样式）', () => expect(
+            missing.length === 0, `缺失：${missing.join(', ')}`));
+
+        const aliasVars = ['--qem-bg-soft', '--qem-bg-hover', '--qem-text-soft'];
+        const missAlias = aliasVars.filter((v) => !uiCss.includes(v + ':'));
+        check('旧 CSS 变量别名保留（兼容 JS 内联引用）', () => expect(
+            missAlias.length === 0, `缺失：${missAlias.join(', ')}`));
+
+        const themeVars = ['--bg-0', '--bg-1', '--bd', '--fg', '--pri', '--err'];
+        const missVar = themeVars.filter((v) => !uiCss.includes(v + ':'));
+        check('设计令牌齐备', () => expect(missVar.length === 0, `缺失：${missVar.join(', ')}`));
+
+        check('样式表含响应式断点（窄屏 + 触控）', () => expect(
+            uiCss.includes('@media (max-width: 720px)') && uiCss.includes('@media (hover: none) and (pointer: coarse)'),
+            '未找到完整断点'));
+        check('主色对齐上游（蓝系 #0067c0 / #4cc2ff）', () => expect(
+            uiCss.includes('#0067c0') && uiCss.includes('#4cc2ff'), '未找到上游主色'));
+    }
+
+    {
+        // 前面的用例可能关掉过所有面板，这里先确保工作台处于打开状态
+        await Q.workspace.open();
+        const root = window.document.getElementById('qem-root').shadowRoot;
+        check('工作台工具栏为卡片容器并含分组分隔线', () => {
+            const tb = root.querySelector('.qem-toolbar');
+            const seps = tb ? tb.querySelectorAll('.qem-sep').length : 0;
+            return expect(!!tb && seps === 5, `工具栏=${!!tb} 分隔线=${seps}（应 6 组 5 条）`);
+        });
+        check('列表区为带边框的内容卡', () => expect(
+            !!root.querySelector('.qem-content'), '未找到 .qem-content'));
+        check('面包屑为独立条带', () => expect(
+            !!root.querySelector('.qem-crumb'), '未找到 .qem-crumb'));
+        check('表格密度遵循目录级视图偏好', () => {
+            Q.config.set('view', { density: 'compact', thumb: false, perDir: true });
+            Q.workspace.render();
+            const t1 = root.querySelector('.qem-content .qem-table');
+            const cls1 = t1 ? t1.className : '未找到表格';
+            const compactOk = cls1.includes('d-compact');
+
+            Q.config.set('view', { density: 'normal', thumb: false, perDir: true });
+            Q.workspace.render();
+            const t2 = root.querySelector('.qem-content .qem-table');
+            const normalOk = !!t2 && !t2.className.includes('d-normal');   // normal 为默认，不加类名
+            return expect(compactOk && normalOk,
+                `紧凑时class=${cls1} 标准=${normalOk}`);
+        });
+        check('开启缩略图后表格渲染缩略图槽位', () => {
+            // 夹具里没有图片文件，这里给视频项挂上封面以覆盖该分支
+            const keep = Q.state.items;
+            Q.state.items = keep.map((i) => (i.category === 'video' ? { ...i, thumbnail: THUMB_DATA } : i));
+            Q.config.set('view', { density: 'normal', thumb: true, perDir: true });
+            Q.workspace.render();
+            const img = root.querySelector('.qem-content .qem-thumb');
+            Q.state.items = keep;
+            Q.config.set('view', { density: 'normal', thumb: false, perDir: true });
+            Q.workspace.render();
+            return expect(!!img, '未渲染 .qem-thumb');
+        });
+    }
+
     /* ---------------- 缺陷修复回归 ---------------- */
+
+    {
+        // ⑤ Shadow DOM 内的 isConnected 判断：此前用 documentElement.contains() 恒为 false，
+        //    连带导致「面板已打开」守卫失效（重复叠面板 / 悬浮球重复创建 / 快捷键整体失效）
+        await Q.workspace.open();
+        await Q.workspace.open();
+        await Q.workspace.open();
+        const root3 = window.document.getElementById('qem-root').shadowRoot;
+        check('重复打开工作台不叠加面板', () => {
+            const contents = root3.querySelectorAll('.qem-content').length;
+            return expect(contents === 1, `内容区数量=${contents}（应 1）`);
+        });
+        check('重复挂载悬浮球不重复创建', () => {
+            Q.fab.mount();
+            Q.fab.mount();
+            const n = root3.querySelectorAll('.qem-fab').length;
+            return expect(n === 1, `悬浮球数量=${n}（应 1）`);
+        });
+        check('面板内快捷键生效（全选 / 取消选择）', () => {
+            Q.sel.clear();
+            window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));
+            const afterAll = Q.sel.count();
+            window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            const afterEsc = Q.sel.count();
+            return expect(afterAll === Q.state.items.length && afterEsc === 0,
+                `全选=${afterAll} 共=${Q.state.items.length} 取消后=${afterEsc}`);
+        });
+        check('快捷键：输入框聚焦时不应触发（不干扰打字）', () => {
+            Q.sel.clear();
+            const input = window.document.createElement('input');
+            root3.appendChild(input);
+            input.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));
+            const typed = Q.sel.count();
+            input.remove();
+            return expect(typed === 0, `输入框内全选数=${typed}（应 0）`);
+        });
+    }
 
     {
         // ① 节流关闭时应真正全速：以「开/关耗时对比」判定，避免依赖绝对时间

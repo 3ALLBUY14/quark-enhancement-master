@@ -2,7 +2,7 @@
 // @name               夸克增强大师
 // @name:en            Quark Enhancement Master
 // @namespace          https://github.com/3ALLBUY14/quark-enhancement-master
-// @version            0.1.4
+// @version            0.1.6
 // @author             Quark port / 原版 PikPak Enhancement Master by digbug82
 // @license            AGPL-3.0-or-later
 // @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
@@ -10,7 +10,7 @@
 // @homepage           https://github.com/3ALLBUY14/quark-enhancement-master
 // @match              https://pan.quark.cn/*
 // @match              https://drive-pc.quark.cn/*
-// @icon               data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%2307c160'/%3E%3Cpath d='M18 40c2-9 7-14 14-14s12 5 14 14' stroke='%23fff' stroke-width='5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E
+// @icon               data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%230067c0'/%3E%3Cpath d='M18 40c2-9 7-14 14-14s12 5 14 14' stroke='%23fff' stroke-width='5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E
 // @grant              GM_setValue
 // @grant              GM_getValue
 // @grant              GM_deleteValue
@@ -60,7 +60,7 @@
      * 0. 常量
      * ==================================================================== */
 
-    const VERSION = '0.1.4';
+    const VERSION = '0.1.6';
     const LS_CFG = 'qem_cfg_v1';
     const LS_CACHE_PREFIX = 'qem_cache_';
     const ROOT_FID = '0';
@@ -572,130 +572,293 @@
      * ==================================================================== */
 
     const UI_CSS = `
+/* ======================================================================
+ * UI 设计系统 v2 —— 贴近上游 PikPak Enhancement Master 的设计语言
+ * （蓝系主色 #0067c0/#4cc2ff、软底色分层、多级阴影、清晰的区域边界）
+ * 令牌命名对齐上游 --pk-*，并保留旧 --qem-* 别�名以兼容 JS 内联引用。
+ * ==================================================================== */
+
 :host { all: initial; }
 * { box-sizing: border-box; }
+
 .qem-scope {
-  --qem-bg: #ffffff;
-  --qem-bg-soft: #f5f6f8;
-  --qem-bg-hover: #eef0f3;
-  --qem-border: #e3e5e8;
-  --qem-text: #1b1c1f;
-  --qem-text-soft: #6b7075;
-  --qem-accent: #07c160;
-  --qem-accent-soft: rgba(7,193,96,.12);
-  --qem-danger: #e34d59;
-  --qem-warn: #ed7b2f;
-  --qem-shadow: 0 12px 40px rgba(0,0,0,.16);
-  --qem-radius: 10px;
-  font: 13px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-  color: var(--qem-text);
+  /* —— 基础令牌（浅色） —— */
+  --bg-0: #ffffff;          /* 面板主面 */
+  --bg-1: #f5f6f8;          /* 软底色条：页眉/页脚/工具栏/表头 */
+  --bg-2: #eef0f3;          /* 悬停 */
+  --bg-3: #e5e8ec;          /* 强悬停 */
+  --bd:   #e5e5e5;          /* 细边框 */
+  --bd-2: #d9dce1;          /* 强边框 */
+  --fg:   #1a1a1a;          /* 正文 */
+  --fg-2: #5f6670;          /* 次级文字 */
+  --fg-3: #8a9199;          /* 弱化文字/图标 */
+  --pri:  #0067c0;          /* 主色（同上游 --pk-pri） */
+  --pri-fg: #ffffff;
+  --pri-hov: #005fa8;
+  --pri-soft: #e6f3ff;      /* 选中底 */
+  --pri-bd: #cce8ff;        /* 选中框 */
+  --ok:   #16a06b;
+  --ok-soft: #e3f6ee;
+  --warn: #d97706;
+  --warn-soft: #fdf0dd;
+  --err:  #d93025;
+  --err-soft: #fbe7e4;
+  --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-xl: 14px;
+  --sh-1: 0 1px 2px rgba(0,0,0,.05), 0 2px 8px rgba(0,0,0,.05);
+  --sh-2: 0 8px 24px rgba(0,0,0,.12);
+  --sh-3: 0 25px 50px rgba(0,0,0,.18);
+  /* 兼容旧变量名（JS 内联样式仍在用） */
+  --qem-bg: var(--bg-0); --qem-bg-soft: var(--bg-1); --qem-bg-hover: var(--bg-2);
+  --qem-border: var(--bd); --qem-text: var(--fg); --qem-text-soft: var(--fg-2);
+  --qem-accent: var(--pri); --qem-accent-soft: var(--pri-soft);
+  --qem-danger: var(--err); --qem-warn: var(--warn); --qem-shadow: var(--sh-2); --qem-radius: var(--r-md);
+
+  font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
 }
+
 .qem-scope.qem-dark {
-  --qem-bg: #1d1f23;
-  --qem-bg-soft: #26282d;
-  --qem-bg-hover: #303338;
-  --qem-border: #3a3d43;
-  --qem-text: #eceef1;
-  --qem-text-soft: #9aa0a6;
-  --qem-danger: #f06b76;
-  --qem-shadow: 0 12px 40px rgba(0,0,0,.5);
+  --bg-0: #1f2123; --bg-1: #26282b; --bg-2: #2d2f33; --bg-3: #35383d;
+  --bd: #333333; --bd-2: #404347;
+  --fg: #f5f5f5; --fg-2: #a9b0b8; --fg-3: #7d848c;
+  --pri: #4cc2ff; --pri-fg: #08243a; --pri-hov: #6fd0ff;
+  --pri-soft: #2b3a4a; --pri-bd: #2f4a63;
+  --ok: #2fbf8f; --ok-soft: rgba(47,191,143,.14);
+  --warn: #e6a23c; --warn-soft: rgba(230,162,60,.16);
+  --err: #f06b76; --err-soft: rgba(240,107,118,.15);
+  --sh-1: 0 1px 2px rgba(0,0,0,.4);
+  --sh-2: 0 8px 24px rgba(0,0,0,.42);
+  --sh-3: 0 25px 50px rgba(0,0,0,.55);
 }
-.qem-scope button { font: inherit; cursor: pointer; border: 1px solid var(--qem-border); background: var(--qem-bg); color: var(--qem-text); border-radius: 7px; padding: 5px 10px; transition: background .15s, border-color .15s; }
-.qem-scope button:hover { background: var(--qem-bg-hover); }
-.qem-scope button:disabled { opacity: .5; cursor: not-allowed; }
-.qem-scope button.primary { background: var(--qem-accent); border-color: var(--qem-accent); color: #fff; }
-.qem-scope button.primary:hover { filter: brightness(1.06); }
-.qem-scope button.danger { color: var(--qem-danger); border-color: color-inherit; }
-.qem-scope button.danger:hover { background: rgba(227,77,89,.1); }
+
+/* —— 表单控件 —— */
+.qem-scope button {
+  font: inherit; color: var(--fg); background: var(--bg-0);
+  border: 1px solid var(--bd-2); border-radius: var(--r-sm);
+  padding: 5px 12px; cursor: pointer; user-select: none;
+  transition: background .12s, border-color .12s, box-shadow .12s, color .12s;
+}
+.qem-scope button:hover { background: var(--bg-2); border-color: var(--bd-2); }
+.qem-scope button:active { transform: translateY(0); }
+.qem-scope button:disabled { opacity: .45; cursor: not-allowed; }
+.qem-scope button:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--pri-soft); border-color: var(--pri); }
+.qem-scope button.primary { background: var(--pri); border-color: var(--pri); color: var(--pri-fg); font-weight: 500; }
+.qem-scope button.primary:hover { background: var(--pri-hov); border-color: var(--pri-hov); }
+.qem-scope button.danger { color: var(--err); }
+.qem-scope button.danger:hover { background: var(--err-soft); border-color: var(--err); color: var(--err); }
 .qem-scope button.ghost { border-color: transparent; background: transparent; }
-.qem-scope input[type=text], .qem-scope input[type=number], .qem-scope input[type=password], .qem-scope select, .qem-scope textarea {
-  font: inherit; color: var(--qem-text); background: var(--qem-bg); border: 1px solid var(--qem-border); border-radius: 7px; padding: 5px 8px; width: 100%; outline: none;
+
+.qem-scope input[type=text], .qem-scope input[type=number], .qem-scope input[type=password], .qem-scope input[type=date],
+.qem-scope select, .qem-scope textarea {
+  font: inherit; color: var(--fg); background: var(--bg-0);
+  border: 1px solid var(--bd-2); border-radius: var(--r-sm);
+  padding: 6px 9px; width: 100%; outline: none;
+  transition: border-color .12s, box-shadow .12s;
 }
-.qem-scope input:focus, .qem-scope select:focus, .qem-scope textarea:focus { border-color: var(--qem-accent); }
-.qem-scope label { display: inline-flex; align-items: center; gap: 6px; }
+.qem-scope input:focus, .qem-scope select:focus, .qem-scope textarea:focus {
+  border-color: var(--pri); box-shadow: 0 0 0 3px var(--pri-soft);
+}
+.qem-scope input::placeholder, .qem-scope textarea::placeholder { color: var(--fg-3); }
+.qem-scope input[type=checkbox] { width: auto; accent-color: var(--pri); }
+.qem-scope select { cursor: pointer; }
+.qem-scope textarea { resize: vertical; line-height: 1.5; }
+.qem-scope label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+
+/* —— 布局工具类 —— */
 .qem-scope .row { display: flex; align-items: center; gap: 8px; }
 .qem-scope .col { display: flex; flex-direction: column; gap: 10px; }
-.qem-scope .muted { color: var(--qem-text-soft); }
+.qem-scope .muted { color: var(--fg-2); }
 .qem-scope .grow { flex: 1; min-width: 0; }
 .qem-scope .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 悬浮球 */
-.qem-fab { position: fixed; z-index: 2147483000; width: 46px; height: 46px; border-radius: 50%; background: var(--qem-accent); color: #fff; border: none; box-shadow: var(--qem-shadow); display: flex; align-items: center; justify-content: center; font-size: 20px; user-select: none; }
+/* —— 悬浮球 —— */
+.qem-fab {
+  position: fixed; z-index: 2147483000; width: 48px; height: 48px;
+  border-radius: 50%; border: none; cursor: pointer; user-select: none;
+  background: linear-gradient(135deg, #0f83e6, #0067c0);
+  color: #fff; font-size: 20px;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 6px 16px rgba(0,103,192,.38), inset 0 1px 0 rgba(255,255,255,.28);
+  transition: transform .15s, box-shadow .15s;
+}
+.qem-fab:hover { transform: translateY(-2px); box-shadow: 0 10px 24px rgba(0,103,192,.45); }
+.qem-fab:active { transform: none; }
+.qem-dark .qem-fab { background: linear-gradient(135deg, #3aa5f2, #1f7fd0); box-shadow: 0 6px 16px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.16); }
 .qem-fab.br { right: 22px; bottom: 96px; } .qem-fab.bl { left: 22px; bottom: 96px; }
 .qem-fab.tr { right: 22px; top: 96px; }   .qem-fab.tl { left: 22px; top: 96px; }
 
-/* 面板 */
-.qem-mask { position: fixed; inset: 0; z-index: 2147483001; background: rgba(0,0,0,.42); display: flex; align-items: center; justify-content: center; }
-.qem-panel { background: var(--qem-bg); border-radius: 12px; box-shadow: var(--qem-shadow); display: flex; flex-direction: column; overflow: hidden; }
+/* —— 遮罩与面板 —— */
+.qem-mask {
+  position: fixed; inset: 0; z-index: 2147483001;
+  background: rgba(15, 20, 28, .5); backdrop-filter: blur(2px);
+  display: flex; align-items: center; justify-content: center;
+}
+.qem-panel {
+  background: var(--bg-0); border: 1px solid var(--bd-2); border-radius: var(--r-xl);
+  box-shadow: var(--sh-3); display: flex; flex-direction: column; overflow: hidden;
+  animation: qem-pop .16s ease-out;
+}
+@keyframes qem-pop { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: none; } }
 .qem-panel.qem-lg { width: min(1180px, 94vw); height: min(760px, 92vh); }
 .qem-panel.qem-md { width: min(720px, 94vw); max-height: 88vh; }
 .qem-panel.qem-sm { width: min(460px, 92vw); }
-.qem-head { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--qem-border); background: var(--qem-bg-soft); }
-.qem-head .title { font-weight: 600; font-size: 14px; }
-.qem-body { flex: 1; overflow: auto; padding: 12px 14px; }
-.qem-foot { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--qem-border); background: var(--qem-bg-soft); flex-wrap: wrap; }
 
-/* タブ */
-.qem-tabs { display: flex; gap: 2px; overflow-x: auto; border-bottom: 1px solid var(--qem-border); background: var(--qem-bg-soft); padding: 0 8px; }
-.qem-tab { padding: 8px 12px; border: none; background: transparent; border-bottom: 2px solid transparent; border-radius: 0; white-space: nowrap; color: var(--qem-text-soft); }
-.qem-tab.active { color: var(--qem-accent); border-bottom-color: var(--qem-accent); font-weight: 600; }
+/* —— 面板三区：页眉 / 内容 / 页脚（明确的区域边界） —— */
+.qem-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px; background: var(--bg-1); border-bottom: 1px solid var(--bd);
+}
+.qem-head .title { font-weight: 600; font-size: 15px; letter-spacing: .2px; color: var(--fg); }
+.qem-head button.ghost {
+  width: 28px; height: 28px; padding: 0; border-radius: var(--r-sm);
+  color: var(--fg-3); font-size: 15px; line-height: 1;
+}
+.qem-head button.ghost:hover { background: var(--bg-2); color: var(--fg); }
+.qem-body { flex: 1; overflow: auto; padding: 14px 16px; }
+.qem-foot {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 16px; background: var(--bg-1); border-top: 1px solid var(--bd);
+}
+.qem-foot .muted { font-size: 12.5px; }
 
-/* 表格 */
-.qem-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-.qem-table th, .qem-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--qem-border); vertical-align: middle; }
-.qem-table th { position: sticky; top: 0; background: var(--qem-bg-soft); z-index: 1; font-weight: 600; white-space: nowrap; }
-.qem-table tbody tr:hover { background: var(--qem-bg-hover); }
-.qem-table tbody tr.sel { background: var(--qem-accent-soft); }
-.qem-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
-.qem-table .name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+/* —— 面包屑（独立条带，与工具栏分明） —— */
+.qem-crumb {
+  display: flex; align-items: center; gap: 2px; flex-wrap: wrap;
+  padding: 6px 10px; background: var(--bg-1);
+  border: 1px solid var(--bd); border-radius: var(--r-lg); font-size: 12.5px;
+}
+.qem-crumb button { border: none; background: transparent; padding: 3px 6px; border-radius: var(--r-sm); color: var(--pri); }
+.qem-crumb button:hover { background: var(--pri-soft); }
+.qem-crumb button:last-of-type { color: var(--fg); font-weight: 600; }
+.qem-crumb span.sep { color: var(--fg-3); margin: 0 1px; }
+
+/* —— 工具栏（软底色卡片，按钮为浮起芯片） —— */
+.qem-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 8px 10px; background: var(--bg-1);
+  border: 1px solid var(--bd); border-radius: var(--r-lg);
+}
+.qem-toolbar button {
+  border-color: transparent; background: transparent;
+  padding: 5px 10px; font-size: 12.5px;
+}
+.qem-toolbar button:hover { background: var(--bg-0); border-color: var(--bd-2); box-shadow: var(--sh-1); }
+.qem-toolbar button.primary { background: var(--pri); color: var(--pri-fg); border-color: transparent; }
+.qem-toolbar button.primary:hover { background: var(--pri-hov); }
+.qem-toolbar button.danger { color: var(--err); }
+.qem-toolbar button.danger:hover { background: var(--err-soft); border-color: var(--err); }
+.qem-sep { width: 1px; height: 22px; background: var(--bd-2); margin: 0 2px; flex: 0 0 auto; }
+
+/* —— 内容区（带边框的内容卡，框出列表区域） —— */
+.qem-content { border: 1px solid var(--bd); border-radius: var(--r-lg); background: var(--bg-0); overflow: hidden; }
+
+/* —— タブ —— */
+.qem-tabs { display: flex; gap: 2px; overflow-x: auto; padding: 0 10px; background: var(--bg-1); border-bottom: 1px solid var(--bd); }
+.qem-tab {
+  padding: 9px 14px; border: none; background: transparent; border-radius: 0;
+  border-bottom: 2px solid transparent; color: var(--fg-2); white-space: nowrap; font-size: 13px;
+}
+.qem-tab:hover { color: var(--fg); background: var(--bg-2); }
+.qem-tab.active { color: var(--pri); border-bottom-color: var(--pri); font-weight: 600; }
+
+/* —— 表格 —— */
+.qem-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.qem-table th {
+  position: sticky; top: 0; z-index: 2; background: var(--bg-1);
+  color: var(--fg-2); font-weight: 600; font-size: 12px;
+  padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--bd-2); white-space: nowrap;
+}
+.qem-table td { padding: 8px 10px; border-bottom: 1px solid var(--bd); vertical-align: middle; }
+.qem-table tbody tr { transition: background .12s; }
+.qem-table tbody tr:hover { background: var(--bg-2); }
+.qem-table tbody tr.sel { background: var(--pri-soft); box-shadow: inset 3px 0 0 var(--pri); }
+.qem-table tbody tr:last-child td { border-bottom: none; }
+.qem-table th[title] { cursor: pointer; user-select: none; }
+.qem-table th[title]:hover { background: var(--bg-2); color: var(--fg); }
+.qem-table td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--fg-2); }
+.qem-table .name { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .qem-table .name .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.qem-crumb { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 12.5px; }
-.qem-crumb button { border: none; background: transparent; padding: 2px 4px; color: var(--qem-accent); }
-.qem-crumb span.sep { color: var(--qem-text-soft); }
 
-/* 标签 */
-.qem-tag { display: inline-block; padding: 1px 6px; border-radius: 5px; background: var(--qem-bg-hover); color: var(--qem-text-soft); font-size: 11.5px; }
-.qem-tag.ok { background: rgba(7,193,96,.14); color: var(--qem-accent); }
-.qem-tag.warn { background: rgba(237,123,47,.16); color: var(--qem-warn); }
-.qem-tag.err { background: rgba(227,77,89,.14); color: var(--qem-danger); }
+/* —— 标签 —— */
+.qem-tag {
+  display: inline-flex; align-items: center; padding: 1px 8px;
+  border-radius: 999px; background: var(--bg-2); color: var(--fg-2);
+  font-size: 11.5px; font-weight: 500;
+}
+.qem-tag.ok { background: var(--ok-soft); color: var(--ok); }
+.qem-tag.warn { background: var(--warn-soft); color: var(--warn); }
+.qem-tag.err { background: var(--err-soft); color: var(--err); }
 
-/* 进度 */
-.qem-bar { height: 6px; border-radius: 999px; background: var(--qem-bg-hover); overflow: hidden; }
-.qem-bar > i { display: block; height: 100%; background: var(--qem-accent); width: 0; transition: width .2s; }
+/* —— 进度条 —— */
+.qem-bar { height: 8px; border-radius: 999px; background: var(--bg-2); overflow: hidden; }
+.qem-bar > i { display: block; height: 100%; width: 0; border-radius: 999px; background: var(--pri); transition: width .2s; }
 
-/* 提示条 */
-.qem-toasts { position: fixed; z-index: 2147483600; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
-.qem-toast { background: var(--qem-bg); color: var(--qem-text); border: 1px solid var(--qem-border); border-left: 3px solid var(--qem-accent); border-radius: 8px; padding: 8px 12px; box-shadow: var(--qem-shadow); max-width: 380px; animation: qem-in .18s ease-out; }
-.qem-toast.error { border-left-color: var(--qem-danger); }
-.qem-toast.warn { border-left-color: var(--qem-warn); }
+/* —— 提示条 —— */
+.qem-toasts { position: fixed; z-index: 2147483600; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 10px; align-items: flex-end; }
+.qem-toast {
+  background: var(--bg-0); color: var(--fg); border: 1px solid var(--bd-2);
+  border-left: 3px solid var(--pri); border-radius: var(--r-md);
+  padding: 9px 14px; box-shadow: var(--sh-2); max-width: 400px;
+  animation: qem-in .18s ease-out;
+}
+.qem-toast.error { border-left-color: var(--err); }
+.qem-toast.warn { border-left-color: var(--warn); }
 @keyframes qem-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
-/* 分段器 */
-.qem-seg { display: inline-flex; border: 1px solid var(--qem-border); border-radius: 7px; overflow: hidden; }
-.qem-seg button { border: none; border-radius: 0; border-right: 1px solid var(--qem-border); }
+/* —— 分段器 —— */
+.qem-seg { display: inline-flex; border: 1px solid var(--bd-2); border-radius: var(--r-sm); overflow: hidden; background: var(--bg-0); }
+.qem-seg button { border: none; border-radius: 0; border-right: 1px solid var(--bd); }
 .qem-seg button:last-child { border-right: none; }
-.qem-seg button.active { background: var(--qem-accent); color: #fff; }
+.qem-seg button.active { background: var(--pri); color: var(--pri-fg); }
 
-/* 空态 */
-.qem-empty { padding: 40px 10px; text-align: center; color: var(--qem-text-soft); }
-.qem-drop { border: 1px dashed var(--qem-border); border-radius: 8px; padding: 10px; }
+/* —— 空态 / 虚线卡 / 滚动 / 等宽 —— */
+.qem-empty { padding: 44px 12px; text-align: center; color: var(--fg-2); }
+.qem-drop { border: 1px dashed var(--bd-2); border-radius: var(--r-lg); padding: 12px; background: var(--bg-1); }
 .qem-scroll { overflow: auto; }
 .qem-mono { font-family: ui-monospace, Consolas, Menlo, monospace; font-size: 12px; }
 
-/* 表格密度（视图偏好，按目录记忆） */
+/* —— 表格密度（视图偏好） —— */
 .qem-table.d-compact td, .qem-table.d-compact th { padding: 2px 8px; }
-.qem-table.d-normal  td, .qem-table.d-normal  th { padding: 6px 8px; }
-.qem-table.d-loose   td, .qem-table.d-loose   th { padding: 11px 10px; }
+.qem-table.d-normal td, .qem-table.d-normal th { padding: 6px 8px; }
+.qem-table.d-loose td, .qem-table.d-loose th { padding: 11px 10px; }
 
-/* 缩略图（启用后展示接口返回的封面，避免该字段白白拉取却不用） */
-.qem-thumb { width: 30px; height: 30px; border-radius: 5px; object-fit: cover; background: var(--qem-bg-hover); flex: 0 0 auto; }
+/* —— 缩略图 —— */
+.qem-thumb { width: 30px; height: 30px; border-radius: 5px; object-fit: cover; background: var(--bg-2); flex: 0 0 auto; }
 .qem-table.d-compact .qem-thumb { width: 22px; height: 22px; }
 
-/* 排行条：.track 宽度表示占比，.val 显示数值 */
+/* —— 排行条 —— */
 .qem-rank { display: flex; align-items: center; gap: 8px; }
-.qem-rank .track { flex: 1; height: 8px; border-radius: 999px; background: var(--qem-bg-hover); overflow: hidden; min-width: 60px; }
-.qem-rank .track > i { display: block; height: 100%; background: var(--qem-accent); }
-.qem-rank .val { min-width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
+.qem-rank .track { flex: 1; height: 8px; border-radius: 999px; background: var(--bg-2); overflow: hidden; min-width: 60px; }
+.qem-rank .track > i { display: block; height: 100%; background: var(--pri); }
+.qem-rank .val { min-width: 84px; text-align: right; font-variant-numeric: tabular-nums; color: var(--fg-2); }
+
+/* —— 滚动条（细、悬停加深） —— */
+.qem-scope ::-webkit-scrollbar { width: 10px; height: 10px; }
+.qem-scope ::-webkit-scrollbar-track { background: transparent; }
+.qem-scope ::-webkit-scrollbar-thumb { background: var(--bd-2); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+.qem-scope ::-webkit-scrollbar-thumb:hover { background: var(--fg-3); background-clip: padding-box; }
+
+/* —— 响应式：小屏大面板全屏、小弹窗收敛 —— */
+@media (max-width: 720px) {
+  .qem-panel.qem-lg { width: 100vw !important; height: 100vh !important; border-radius: 0; border: none; }
+  .qem-panel.qem-md, .qem-panel.qem-sm { width: 94vw; max-height: 88vh; }
+  .qem-head { padding: 10px 12px; }
+  .qem-body { padding: 10px 12px; }
+  .qem-foot { padding: 8px 12px; }
+  .qem-toolbar { gap: 5px; padding: 7px 8px; }
+  .qem-crumb { padding: 5px 8px; }
+}
+/* —— 响应式：触控设备放大点击目标 —— */
+@media (hover: none) and (pointer: coarse) {
+  .qem-scope button { min-height: 38px; padding: 8px 12px; }
+  .qem-toolbar button { min-height: 34px; }
+  .qem-table td { padding: 10px; }
+  .qem-table th[title] { min-height: 38px; }
+  .qem-fab { width: 52px; height: 52px; }
+  .qem-head button.ghost { width: 32px; height: 32px; }
+}
+
 `;
 
     const ui = {
@@ -706,7 +869,7 @@
 
         /** 懒创建 Shadow 宿主 */
         ensureHost() {
-            if (this.host && document.documentElement.contains(this.host)) return;
+            if (this.host && this.host.isConnected) return;
             const host = document.createElement('div');
             host.id = NS + '-root';
             host.style.cssText = 'all:initial;position:static';
@@ -3161,7 +3324,7 @@ ${warn}
         syncFoot: () => { },
 
         async open() {
-            if (state.ui && document.documentElement.contains(state.ui.el)) return;
+            if (state.ui && state.ui.el && state.ui.el.isConnected) return;
             const p = ui.panel({
                 title: t('appTitle') + ' · ' + t('navPanel'),
                 size: 'lg',
@@ -3180,12 +3343,12 @@ ${warn}
             const crumb = document.createElement('div');
             crumb.className = 'qem-crumb';
             const tools = document.createElement('div');
-            tools.className = 'row';
-            tools.style.flexWrap = 'wrap';
+            tools.className = 'qem-toolbar';
             bar.append(crumb, tools);
             p.body.appendChild(bar);
 
             const listBox = document.createElement('div');
+            listBox.className = 'qem-content';
             p.body.appendChild(listBox);
 
             const footInfo = document.createElement('div');
@@ -3220,25 +3383,44 @@ ${warn}
                     tools.appendChild(b);
                     return b;
                 };
+                // 功能分组分隔线，让 20+ 个入口在视觉上分区
+                const sep = () => {
+                    if (!tools.lastElementChild) return;                       // 首个分组前不画
+                    if (tools.lastElementChild.className === 'qem-sep') return;  // 避免连排
+                    const d = document.createElement('span');
+                    d.className = 'qem-sep';
+                    tools.appendChild(d);
+                };
+                // ① 目录
                 mk('⟳ ' + t('refresh'), () => workspace.reload());
                 mk('📁 ' + t('btnNewFolder'), () => workspace.newFolder());
+                sep();
+                // ② 文件操作
                 mk('✏️ ' + t('btnRename'), () => renameTool.open());
                 mk('📥 ' + t('btnDownload'), () => downloader.downloadSelection());
                 mk('🔗 ' + t('btnDirect'), () => downloader.exportDirectLinks());
                 mk('✂️ ' + t('btnMove'), () => workspace.moveSelection());
                 mk('🗑 ' + t('btnDelete'), () => workspace.deleteSelection(), 'danger');
+                sep();
+                // ③ 分析与清理
                 mk('🔍 ' + t('btnInsight'), () => insight.open());
                 mk('🧬 ' + t('btnDedup'), () => dedup.openFiles());
-                mk('🧹 ' + t('btnClean'), () => cleanup.open());
                 mk('🔤 ' + t('btnFolderDedup'), () => dedup.openFolders());
+                mk('🧹 ' + t('btnClean'), () => cleanup.open());
+                sep();
+                // ④ 导出与检索
                 mk('🌲 ' + t('btnTree'), () => exporter.tree());
                 mk('🎵 ' + t('btnM3u'), () => exporter.m3u());
                 mk('📄 ' + t('btnMagnet'), () => exporter.magnet());
                 mk('📊 ' + t('btnCsv'), () => exporter.csv());
                 mk('🖼 ' + t('btnImgSearch'), () => imgSearch.open());
+                sep();
+                // ⑤ 分享与回收站
                 mk('🔗 ' + t('btnShare'), () => shareTool.create());
                 mk('🧩 ' + t('btnShareParse'), () => shareTool.parse());
                 mk('♻️ ' + t('btnTrash'), () => trash.open());
+                sep();
+                // ⑥ 可恢复性与视图
                 mk('↩ ' + t('btnUndo'), () => workspace.undoLatest());
                 mk('🕘 ' + t('btnHistory'), () => opLog.open());
                 mk('🧾 ' + t('btnSnapshot'), () => snapshot.open());
@@ -5753,7 +5935,7 @@ ${warn}
                 // 面板开关键全局生效
                 if (combo === sc.panel) {
                     e.preventDefault();
-                    if (state.ui && document.documentElement.contains(state.ui.el)) state.ui.close();
+                    if (state.ui && state.ui.el && state.ui.el.isConnected) state.ui.close();
                     else workspace.open();
                     return;
                 }
@@ -5763,7 +5945,7 @@ ${warn}
                 const tag = (e.target && e.target.tagName) || '';
                 const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target && e.target.isContentEditable);
                 if (typing) return;
-                const panelOpen = state.ui && document.documentElement.contains(state.ui.el);
+                const panelOpen = !!(state.ui && state.ui.el && state.ui.el.isConnected);
                 if (!panelOpen) return;
 
                 const actions = {
@@ -5822,7 +6004,7 @@ ${warn}
         el: null,
 
         mount() {
-            if (this.el && document.documentElement.contains(this.el)) return;
+            if (this.el && this.el.isConnected) return;
             const btn = document.createElement('button');
             btn.className = 'qem-fab ' + (config.get('fab.pos', 'br') || 'br');
             btn.textContent = '☁';
@@ -5902,7 +6084,7 @@ ${warn}
 
         // 页面导航时同步工作台目录（若面板已打开）
         window.addEventListener('hashchange', () => {
-            if (!state.ui || !document.documentElement.contains(state.ui.el)) return;
+            if (!state.ui || !state.ui.el || !state.ui.el.isConnected) return;
             const m = /#\/list\/[^/]*\/([0-9a-fA-F]{16,})/.exec(location.hash);
             if (m && m[1] && m[1] !== state.cwd) {
                 state.path.push({ fid: m[1], name: '已同步目录' });
@@ -5935,6 +6117,7 @@ ${warn}
                 opLog, conflict, capacityGuard, snapshot, cfgHistory, spaceReport, deleteWithUndo, crossCheck, viewPref,
                 workspace, dedup, cleanup, exporter, shareTool, trash, settings,
                 downloader, player, imgSearch, insight, preview, property, picker, state, sel,
+                fab, shortcutMgr,
             };
         } catch (e) { /* 忽略 */ }
     }
