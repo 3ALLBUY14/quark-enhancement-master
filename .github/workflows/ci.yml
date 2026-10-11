@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: 校验（语法 / 代码检查 / 冒烟测试 / 脚本头）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+
+      - name: 语法检查
+        run: npm run check
+
+      - name: 代码检查（ESLint）
+        run: npm run lint
+
+      - name: 冒烟测试（jsdom）
+        run: npm test
+
+      - name: 用户脚本头与版本一致性校验
+        run: node scripts/check-userscript-header.mjs
