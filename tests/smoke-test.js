@@ -749,6 +749,190 @@ check('规则：非法字符被清理', () => !/[\\/:*?"<>|]/.test(Q.renameRules
         check('聚合标签文案', () => Q.spaceReport.groupLabel('files', 3) === '最大的 3 个文件');
     }
 
+    /* ---------------- 视图偏好（按目录独立） ---------------- */
+
+    {
+        check('密度循环：紧凑→标准→宽松→紧凑', () => {
+            const a = Q.viewPref.nextDensity('compact');
+            const b = Q.viewPref.nextDensity('normal');
+            const c = Q.viewPref.nextDensity('loose');
+            return expect(a === 'normal' && b === 'loose' && c === 'compact', `${a},${b},${c}`);
+        });
+        check('密度循环：未知值回落到第一档', () => Q.viewPref.nextDensity('怪值') === 'compact');
+
+        Q.config.set('view', { density: 'normal', thumb: false, perDir: true });
+        Q.config.set('viewPref', {});
+        check('按目录独立：未设置过的目录用默认值', () => {
+            const v = Q.viewPref.get('pdir_x');
+            return expect(v.density === 'normal' && v.thumb === false, JSON.stringify(v));
+        });
+        Q.viewPref.set('pdir_x', { density: 'compact', thumb: true });
+        check('按目录独立：写入后只影响该目录', () => {
+            const x = Q.viewPref.get('pdir_x');
+            const y = Q.viewPref.get('pdir_y');
+            return expect(x.density === 'compact' && x.thumb === true && y.density === 'normal' && y.thumb === false,
+                `x=${JSON.stringify(x)} y=${JSON.stringify(y)}`);
+        });
+        check('按目录独立：局部更新不丢其他字段', () => {
+            Q.viewPref.set('pdir_x', { density: 'loose' });
+            const x = Q.viewPref.get('pdir_x');
+            return expect(x.density === 'loose' && x.thumb === true, JSON.stringify(x));
+        });
+
+        Q.config.set('view.perDir', false);
+        check('关闭目录独立后统一用全局默认', () => {
+            const x = Q.viewPref.get('pdir_x');
+            return expect(x.density === 'normal' && x.thumb === false, JSON.stringify(x));
+        });
+        Q.viewPref.set('pdir_z', { density: 'compact' });
+        check('关闭目录独立后写入的是全局默认', () => {
+            const g = Q.config.get('view', {});
+            return expect(g.density === 'compact' && Q.viewPref.get('pdir_z').density === 'compact', JSON.stringify(g));
+        });
+        Q.viewPref.clearAll();
+        check('清理目录级偏好', () => expect(
+            Object.keys(Q.config.get('viewPref', {})).length === 0, JSON.stringify(Q.config.get('viewPref', {}))));
+
+        Q.config.set('view', { density: 'normal', thumb: true, perDir: true });
+        check('缩略图：仅图片/视频且带封面时启用', () => {
+            const pref = Q.viewPref.get('pdir_t');
+            return expect(
+                Q.viewPref.shouldThumb({ dir: false, category: 'image', thumbnail: 'http://x/1.jpg' }, pref) === true
+                && Q.viewPref.shouldThumb({ dir: true, category: 'folder', thumbnail: 'http://x/2.jpg' }, pref) === false
+                && Q.viewPref.shouldThumb({ dir: false, category: 'doc', thumbnail: 'http://x/3.pdf' }, pref) === false
+                && Q.viewPref.shouldThumb({ dir: false, category: 'image', thumbnail: '' }, pref) === false,
+                '四类边界');
+        });
+        check('缩略图：开关关闭时一律不启用', () => {
+            const pref = { density: 'normal', thumb: false };
+            return Q.viewPref.shouldThumb({ dir: false, category: 'image', thumbnail: 'http://x/1.jpg' }, pref) === false;
+        });
+        Q.config.set('view', { density: 'normal', thumb: false, perDir: true });
+        Q.config.set('viewPref', {});
+    }
+
+    /* ---------------- 跨账号迁移校验 ---------------- */
+
+    {
+        check('清单校验：识别非本工具文件', () => {
+            const codes = [
+                Q.crossCheck.validate(null) === 'not-object',
+                Q.crossCheck.validate({ foo: 1 }) === 'wrong-type',
+                Q.crossCheck.validate({ __type: 'qem-inventory' }) === 'no-items',
+                Q.crossCheck.validate({ __type: 'qem-inventory', items: [] }) === 'no-root',
+            ];
+            return expect(codes.every(Boolean), JSON.stringify(codes));
+        });
+        check('清单校验：合法清单通过', () => {
+            const inv = { __type: 'qem-inventory', v: 1, root: { name: '我的网盘' }, items: [] };
+            return expect(Q.crossCheck.validate(inv) === '', Q.crossCheck.validate(inv));
+        });
+        check('校验错误码都有对应提示文案', () => {
+            const codes = ['not-object', 'wrong-type', 'no-items', 'no-root', 'parse', 'empty'];
+            const missing = codes.filter((c) => {
+                const m = Q.crossCheck.validateMessage(c);
+                return !m || m.startsWith('校验失败');
+            });
+            return expect(missing.length === 0, `缺失文案：${missing.join(',')}`);
+        });
+
+        // 端到端：另一账号清单 vs 本账号当前内容
+        const baselineItems = [
+            { path: '我的网盘/A/x.mkv', size: 100, updated_at: 1, dir: false, fid: 'a1' },
+            { path: '我的网盘/A/y.mkv', size: 200, updated_at: 1, dir: false, fid: 'a2' },
+            { path: '我的网盘/B/z.jpg', size: 300, updated_at: 1, dir: false, fid: 'a3' },
+        ];
+        const currentItems = [
+            { path: '我的网盘/A/x.mkv', size: 100, updated_at: 1, dir: false, fid: 'b1' },
+            { path: '我的网盘/B/z.jpg', size: 999, updated_at: 1, dir: false, fid: 'b3' },   // 体积不一致
+        ];
+        const invRec = Q.crossCheck.inventoryOf(baselineItems);
+        // 注意：inventoryOf 会读取 state.path 作为根名，此处只验证结构
+        check('清单结构包含标识/根名/条目/体积统计', () => expect(
+            invRec.__type === 'qem-inventory' && typeof invRec.root.name === 'string'
+            && Array.isArray(invRec.items) && invRec.items.length === 3 && invRec.size === 600,
+            JSON.stringify({ type: invRec.__type, n: invRec.items.length, size: invRec.size })));
+        const mkSnap = (items, label) => ({
+            id: label, label, at: Date.now(), root: { fid: '', name: '我的网盘' },
+            deep: true, count: items.length, size: items.reduce((s2, i) => s2 + i.size, 0), items: Q.snapshot.pack(items),
+        });
+        const diff = Q.snapshot.compare(mkSnap(baselineItems, '来源'), mkSnap(currentItems, '本账号'));
+        check('跨账号比对：识别本账号缺失', () => expect(
+            diff.removed.length === 1 && diff.removed[0].path === '我的网盘/A/y.mkv',
+            JSON.stringify(diff.removed.map((r) => r.path))));
+        check('跨账号比对：识别内容不一致', () => expect(
+            diff.changed.length === 1 && diff.changed[0].oldSize === 300 && diff.changed[0].newSize === 999,
+            JSON.stringify(diff.changed)));
+        check('跨账号比对：一致的文件不误报', () => expect(
+            diff.added.length === 0 && diff.moved.length === 0,
+            `added=${diff.added.length} moved=${diff.moved.length}`));
+    }
+
+    /* ---------------- 缺陷修复回归 ---------------- */
+
+    {
+        // ① 节流关闭时应真正全速：以「开/关耗时对比」判定，避免依赖绝对时间
+        const measure = async () => {
+            const t0 = Date.now();
+            for (let i = 0; i < 3; i++) await Q.api.raw('capacity', {});
+            return Date.now() - t0;
+        };
+        Q.config.set('turbo', true);
+        Q.config.set('minInterval', 350);
+        const withTurbo = await measure();
+        Q.config.set('turbo', false);
+        const withoutTurbo = await measure();
+        Q.config.set('turbo', true);
+        Q.config.set('minInterval', 120);
+        check('关闭节流后不再施加最小间隔（耗时显著下降）', () => expect(
+            withoutTurbo < withTurbo, `开=${withTurbo}ms 关=${withoutTurbo}ms`));
+    }
+    {
+        // ② 递归扫描防环：目录自我引用（异常数据）不应重复展开
+        FILES['d_cyc'] = [
+            { fid: 'd_cyc', file_name: '自引用', pdir_fid: 'd_cyc', dir: true, size: 0, updated_at: 1, created_at: 1 },
+            { fid: 'f_in', file_name: '内部.txt', pdir_fid: 'd_cyc', dir: false, size: 5, updated_at: 1, created_at: 1 },
+        ];
+        const walked = await Q.scanner.walk('d_cyc', {});
+        delete FILES['d_cyc'];
+        check('递归扫描遇到自引用目录能终止且不重复展开', () => expect(
+            walked.length === 2 && walked.filter((w) => w.name === '内部.txt').length === 1,
+            `条目=${walked.length} 明细=${walked.map((w) => w.name).join(',')}`));
+    }
+    {
+        // ③ 基于缓存降级列表删除前必须提示，选择取消则不执行
+        await Q.workspace.reload('0');
+        const keepStale = Q.state.stale;
+        Q.state.stale = { at: Date.now() - 60000, reason: '模拟接口异常' };
+        deleted.length = 0;
+        const before = calls.filter((c) => c.url.includes('/file/delete')).length;
+        const p = Q.deleteWithUndo([{ fid: 'f_a', name: '电影A.2024.1080p.mkv', size: 1, pdir_fid: '0' }], { label: '缓存数据删除' });
+        const clicked = await clickFoot('取消');
+        const n = await p;
+        const after = calls.filter((c) => c.url.includes('/file/delete')).length;
+        check('缓存降级列表：删除前弹出风险提示', () => expect(clicked === true, `弹窗按钮=${footLabels()}`));
+        check('缓存降级列表：选择取消则不执行删除', () => expect(
+            n === 0 && after === before, `返回=${n} 新增删除请求=${after - before}`));
+        Q.state.stale = keepStale;
+    }
+    {
+        // ④ 回收站超过 200 条时应提示截断，而非静默漏项
+        const mk = (n) => Array.from({ length: n }, (_, i) => ({
+            fid: 'r' + i, file_name: `过期文件${i}.mkv`, size: 10, dir: false, updated_at: Date.now() - i * 1000,
+        }));
+        recycleFixture = mk(201);
+        Q.trash.open();
+        await tick(300);
+        check('回收站超 200 条时标记截断', () => expect(Q.trash._truncated === true, `_truncated=${Q.trash._truncated}`));
+        Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
+        recycleFixture = mk(5);
+        Q.trash.open();
+        await tick(300);
+        check('回收站未超限时不标记截断', () => expect(Q.trash._truncated === false, `_truncated=${Q.trash._truncated}`));
+        Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
+        recycleFixture = null;
+    }
+
     /* ---------------- 结果 ---------------- */
     console.log(results.join('\n'));
     console.log('─'.repeat(56));

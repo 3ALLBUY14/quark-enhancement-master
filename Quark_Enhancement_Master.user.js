@@ -2,10 +2,10 @@
 // @name               夸克增强大师
 // @name:en            Quark Enhancement Master
 // @namespace          https://github.com/3ALLBUY14/quark-enhancement-master
-// @version            0.1.3
+// @version            0.1.4
 // @author             Quark port / 原版 PikPak Enhancement Master by digbug82
 // @license            AGPL-3.0-or-later
-// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
+// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
 // @description:en     Quark Drive enhancement: batch rename, file/folder dedup, cleanup, directory-tree export, M3U export, magnet extraction, file insight/filter, sorting, direct-link export with Aria2/IDM, PotPlayer launcher, batch share & share-import, recycle bin, reverse image search, config backup.
 // @homepage           https://github.com/3ALLBUY14/quark-enhancement-master
 // @match              https://pan.quark.cn/*
@@ -60,7 +60,7 @@
      * 0. 常量
      * ==================================================================== */
 
-    const VERSION = '0.1.3';
+    const VERSION = '0.1.4';
     const LS_CFG = 'qem_cfg_v1';
     const LS_CACHE_PREFIX = 'qem_cache_';
     const ROOT_FID = '0';
@@ -331,6 +331,8 @@
         clickAction: 'preview',      // preview | download
         privacyMode: 'off',          // off | list | grid | both —— 列表页遮罩文件名
         sortPref: {},                // pdir_fid -> { key, order }
+        view: { density: 'normal', thumb: false, perDir: true },   // 视图偏好默认值
+        viewPref: {},                // pdir_fid -> { density, thumb }（按目录独立记忆）
         scrollPref: {},              // pdir_fid -> scrollTop
         dedup: { keep: 'new', ignoreExt: false, minSize: 0 },
         folderDedup: { threshold: 0.86, ignoreExt: true },
@@ -550,6 +552,7 @@
         btnHistory: '操作历史',
         btnSnapshot: '目录快照',
         btnSpace: '空间分析',
+        btnCrossCheck: '跨账号校验',
         title_share_result: '分享成功',
         // 提示
         noSelection: '请先选择要操作的项目',
@@ -678,6 +681,15 @@
 .qem-drop { border: 1px dashed var(--qem-border); border-radius: 8px; padding: 10px; }
 .qem-scroll { overflow: auto; }
 .qem-mono { font-family: ui-monospace, Consolas, Menlo, monospace; font-size: 12px; }
+
+/* 表格密度（视图偏好，按目录记忆） */
+.qem-table.d-compact td, .qem-table.d-compact th { padding: 2px 8px; }
+.qem-table.d-normal  td, .qem-table.d-normal  th { padding: 6px 8px; }
+.qem-table.d-loose   td, .qem-table.d-loose   th { padding: 11px 10px; }
+
+/* 缩略图（启用后展示接口返回的封面，避免该字段白白拉取却不用） */
+.qem-thumb { width: 30px; height: 30px; border-radius: 5px; object-fit: cover; background: var(--qem-bg-hover); flex: 0 0 auto; }
+.qem-table.d-compact .qem-thumb { width: 22px; height: 22px; }
 
 /* 排行条：.track 宽度表示占比，.val 显示数值 */
 .qem-rank { display: flex; align-items: center; gap: 8px; }
@@ -880,12 +892,12 @@
         },
 
         /** 结果表格：columns = [{key,label,render?,align?,sortable?,width?}] */
-        table(columns, rows, { selectable = false, onSelectionChange = null, maxHeight = '52vh', sortKey = '', sortOrder = 'asc', onSort = null } = {}) {
+        table(columns, rows, { selectable = false, onSelectionChange = null, maxHeight = '52vh', sortKey = '', sortOrder = 'asc', onSort = null, density = '' } = {}) {
             const wrap = document.createElement('div');
             wrap.className = 'qem-scroll';
             wrap.style.maxHeight = maxHeight;
             const table = document.createElement('table');
-            table.className = 'qem-table';
+            table.className = 'qem-table' + (density && density !== 'normal' ? ' d-' + density : '');
             const thead = document.createElement('thead');
             const trh = document.createElement('tr');
             const selected = new Set();
@@ -1141,11 +1153,13 @@
         },
 
         pump() {
-            const max = config.get('turbo', true) ? Math.max(1, Number(config.get('concurrency', 4)) || 4) : 1;
+            const turbo = config.get('turbo', true);
+            const max = turbo ? Math.max(1, Number(config.get('concurrency', 4)) || 4) : 1;
             while (this.running < max && this.queue.length) {
                 const job = this.queue.shift();
                 this.running++;
-                const wait = Math.max(0, (Number(config.get('minInterval', 120)) || 0) - (Date.now() - this.lastAt));
+                // 节流关闭时不再施加最小间隔，与设置页「关闭将全速请求」的说明保持一致
+                const wait = turbo ? Math.max(0, (Number(config.get('minInterval', 120)) || 0) - (Date.now() - this.lastAt)) : 0;
                 setTimeout(async () => {
                     this.lastAt = Date.now();
                     try { job.resolve(await job.fn()); } catch (e) { job.reject(e); } finally {
@@ -1487,6 +1501,7 @@
         async walk(rootFid = ROOT_FID, { rootPath = '', maxDepth = 20, excludeRe = null, onProgress = null, useCache = false } = {}) {
             const out = [];
             let visited = 0;
+            const seen = new Set([String(rootFid)]);   // 防环：异常数据下同一目录不会被展开两次
             const stack = [{ fid: rootFid, path: rootPath, depth: 0 }];
             while (stack.length) {
                 const node = stack.pop();
@@ -1505,7 +1520,10 @@
                     if (excludeRe && excludeRe.test(it.name)) continue;
                     const child = { ...it, path: node.path ? node.path + '/' + it.name : it.name, depth: node.depth };
                     out.push(child);
-                    if (it.dir) stack.push({ fid: it.fid, path: child.path, depth: node.depth + 1 });
+                    if (it.dir && !seen.has(it.fid)) {
+                        seen.add(it.fid);
+                        stack.push({ fid: it.fid, path: child.path, depth: node.depth + 1 });
+                    }
                 }
             }
             return out;
@@ -2238,10 +2256,10 @@
             p.body.append(form.el, note);
         },
 
-        /** 差异结果面板 */
-        showDiff(oldSnap, newSnap, diff) {
+        /** 差异结果面板；opts 可覆盖标题、四类标签（跨账号口径）与结论文案 */
+        showDiff(oldSnap, newSnap, diff, opts = {}) {
             const p = ui.panel({
-                title: '目录差异对比',
+                title: opts.title || '目录差异对比',
                 size: 'lg',
                 buttons: [{ label: t('close'), onClick: (a) => a.close() }],
             });
@@ -2276,6 +2294,16 @@ ${warn}
                 { key: 'changed', label: `内容变化 (${diff.changed.length})` },
                 { key: 'moved', label: `位置变化 (${diff.moved.length})` },
             ];
+            if (opts.labels) {
+                VIEWS.forEach((v) => { if (opts.labels[v.key]) v.label = opts.labels[v.key]; });
+            }
+            if (opts.note) {
+                const note = document.createElement('div');
+                note.className = 'drop';
+                note.style.marginTop = '10px';
+                note.textContent = opts.note;
+                p.body.appendChild(note);
+            }
 
             const renderView = (key) => {
                 tabs.innerHTML = '';
@@ -2374,9 +2402,19 @@ ${warn}
      * @param {Array} items 待删除项（需含 fid / name / size / pdir_fid）
      * @returns {Promise<number>} 实际提交删除的数量
      */
-    async function deleteWithUndo(items, { label = '批量删除', onProgress = null } = {}) {
+    async function deleteWithUndo(items, { label = '批量删除', onProgress = null, skipStaleCheck = false } = {}) {
         const list = (items || []).filter((i) => i && i.fid);
         if (!list.length) return 0;
+
+        // 缓存降级数据可能已过期，基于它删除存在误删风险，先明确提示
+        if (!skipStaleCheck && state.stale) {
+            const go = await ui.confirm(
+                `当前目录列表是缓存降级数据（${util.ts(state.stale.at)} 采集，原因：${state.stale.reason}），` +
+                '可能与网盘真实内容不一致。\n\n基于这份旧列表删除存在误删风险，建议先刷新目录。是否仍要继续？',
+                { danger: true, okText: '仍要继续' },
+            );
+            if (!go) return 0;
+        }
 
         await api.removeChunked(list.map((i) => i.fid), 100, onProgress);
 
@@ -2827,6 +2865,260 @@ ${warn}
     };
 
     /* ======================================================================
+     * 6.11 视图偏好（按目录独立记忆）
+     *      上游的「视图偏好」是列表/网格切换；本版工作台是管理型列表，
+     *      故落地为「行密度 + 缩略图开关」，两者都可按目录独立记忆，
+     *      并顺带启用数据模型里一直在拉取却未使用的 thumbnail 字段。
+     * ==================================================================== */
+
+    const viewPref = {
+        DENSITIES: ['compact', 'normal', 'loose'],
+        LABEL: { compact: '紧凑', normal: '标准', loose: '宽松' },
+
+        defaults() {
+            const v = config.get('view', {});
+            return { density: v.density || 'normal', thumb: !!v.thumb };
+        },
+
+        /** 读取某目录的视图偏好；perDir 关闭时统一用全局默认 */
+        get(pdir = state.cwd) {
+            if (!config.get('view.perDir', true)) return this.defaults();
+            const map = config.get('viewPref', {}) || {};
+            const rec = map[pdir];
+            return rec ? { ...this.defaults(), ...rec } : this.defaults();
+        },
+
+        set(pdir, patch) {
+            if (!config.get('view.perDir', true)) {
+                const v = { ...config.get('view', {}) };
+                Object.keys(patch || {}).forEach((k) => { v[k] = patch[k]; });
+                config.set('view', v);
+                return;
+            }
+            const map = { ...(config.get('viewPref', {}) || {}) };
+            map[pdir] = { ...this.get(pdir), ...patch };
+            config.set('viewPref', map);
+        },
+
+        /** 密度循环：紧凑 → 标准 → 宽松 → 紧凑 */
+        nextDensity(cur) {
+            const list = this.DENSITIES;
+            const i = list.indexOf(cur);
+            return list[(i + 1) % list.length];
+        },
+
+        /** 是否该目录项展示缩略图（仅图片/视频有封面） */
+        shouldThumb(item, pref) {
+            const p = pref || this.get();
+            return !!(p.thumb && item && !item.dir && item.thumbnail && (item.category === 'image' || item.category === 'video'));
+        },
+
+        /** 供设置页清理所有目录级偏好 */
+        clearAll() { config.set('viewPref', {}); },
+    };
+
+    /* ======================================================================
+     * 6.12 跨账号迁移校验
+     *      换号迁移后「文件到底全没全」此前无法验证。做法：账号 A 导出清单
+     *      指纹文件 → 登录账号 B 导入比对，输出缺失 / 多出 / 内容不一致。
+     *      复用 snapshot 的打包与比对，语义标签换成迁移口径。
+     * ==================================================================== */
+
+    const crossCheck = {
+        TAG: 'qem-inventory',
+        LIMIT_BYTES: 6 * 1024 * 1024,
+        LIMIT_ITEMS: 20000,
+
+        /** 采集清单（不写入快照库，仅内存 + 可下载） */
+        async build(scope = 'deep') {
+            const prefix = state.path.map((s) => s.name).join('/');
+            if (scope === 'current') {
+                return { items: state.items.map((i) => ({ ...i, path: `${prefix}/${i.name}` })), prefix };
+            }
+            const pr = ui.progress('采集账号清单');
+            try {
+                const items = await scanner.walk(state.cwd, {
+                    rootPath: prefix,
+                    onProgress: (n, p) => pr.set(0.5, `已采集 ${n} 项 · ${p}`),
+                });
+                return { items, prefix };
+            } finally { pr.close(); }
+        },
+
+        /** 打包成可下载的清单结构 */
+        inventoryOf(items) {
+            const sum = scanner.summarize(items);
+            return {
+                __type: this.TAG,
+                v: 1,
+                at: Date.now(),
+                scriptVersion: VERSION,
+                root: { name: state.path.map((s) => s.name).join('/') },
+                deep: true,
+                count: items.length,
+                size: sum.size,
+                items: snapshot.pack(items),
+            };
+        },
+
+        /** 校验导入内容是否本工具生成的清单，返回错误码（空串=通过） */
+        validate(obj) {
+            if (!obj || typeof obj !== 'object') return 'not-object';
+            if (obj.__type !== this.TAG) return 'wrong-type';
+            if (!Array.isArray(obj.items)) return 'no-items';
+            if (!obj.root || typeof obj.root.name !== 'string') return 'no-root';
+            return '';
+        },
+
+        validateMessage(code) {
+            return {
+                'not-object': '文件内容不是有效的 JSON 对象',
+                'wrong-type': '这不是本工具导出的账号清单（缺少标识字段）',
+                'no-items': '清单缺少项目列表',
+                'no-root': '清单缺少根目录信息',
+                parse: '文件解析失败，可能不是 JSON 文件',
+                empty: '清单为空',
+            }[code] || ('校验失败：' + code);
+        },
+
+        /** 导出当前账号清单为文件 */
+        async exportFlow() {
+            const p = ui.panel({
+                title: '导出账号清单', size: 'sm', closeOnMask: false,
+                buttons: [
+                    { label: t('cancel'), onClick: (a) => a.close() },
+                    {
+                        label: '开始导出', primary: true,
+                        onClick: async (a) => {
+                            const scope = form.values.scope;
+                            a.close();
+                            if (state.stale && scope === 'current') {
+                                const go = await ui.confirm('当前列表是缓存降级数据（可能已过期），导出的清单会不准确。\n建议先刷新目录再导出。是否仍要继续？', { okText: '仍要继续' });
+                                if (!go) return;
+                            }
+                            let built;
+                            try { built = await crossCheck.build(scope); }
+                            catch (e) { ui.toast('采集失败：' + e.message, 'error'); return; }
+                            const items = built.items;
+                            if (!items.length) return ui.toast('该范围没有可导出的项目', 'warn');
+                            if (items.length > crossCheck.LIMIT_ITEMS) return ui.toast(`项目过多（${items.length}），请缩小范围后重试`, 'error', 5000);
+
+                            const inv = crossCheck.inventoryOf(items);
+                            const text = JSON.stringify(inv);
+                            if (text.length > crossCheck.LIMIT_BYTES) {
+                                return ui.toast(`清单过大（${util.humanSize(text.length)}），建议改用「仅当前目录」或分目录导出`, 'error', 6000);
+                            }
+                            util.saveTextFile(`账号清单_${inv.root.name.replace(/\//g, '_')}_${new Date().toISOString().slice(0, 10)}.json`, text, 'application/json');
+                            ui.toast(`已导出 ${inv.count} 项清单（${util.humanSize(text.length)}），可带到另一个账号导入比对`);
+                        },
+                    },
+                ],
+            });
+            const form = ui.form([
+                { key: 'scope', label: '导出范围', type: 'select', value: 'deep', options: [
+                    { value: 'deep', label: '当前目录及子目录（推荐，覆盖完整）' },
+                    { value: 'current', label: '仅当前目录' },
+                ] },
+            ]);
+            const note = document.createElement('div');
+            note.className = 'muted';
+            note.style.marginTop = '8px';
+            note.textContent = '清单只包含文件路径、体积与修改时间，不含文件内容、账号与凭证，可安全用于跨账号比对。';
+            p.body.append(form.el, note);
+        },
+
+        /** 导入清单并与当前账号实际内容比对 */
+        async compareFlow() {
+            const p = ui.panel({
+                title: '跨账号迁移校验', size: 'sm', closeOnMask: false,
+                buttons: [
+                    { label: t('cancel'), onClick: (a) => a.close() },
+                    {
+                        label: '选择清单文件并比对', primary: true,
+                        onClick: async (a) => {
+                            const scope = form.values.scope;
+                            const file = await crossCheck.pickFile();
+                            if (!file) return;
+                            a.close();
+                            await crossCheck.run(file, scope);
+                        },
+                    },
+                ],
+            });
+            const form = ui.form([
+                { key: 'scope', label: '比对范围', type: 'select', value: 'deep', options: [
+                    { value: 'deep', label: '当前目录及子目录（需与导出时一致）' },
+                    { value: 'current', label: '仅当前目录' },
+                ] },
+            ]);
+            const note = document.createElement('div');
+            note.className = 'muted';
+            note.style.marginTop = '8px';
+            note.textContent = '请在「要核对的那个账号」里打开本面板，先进入与导出时相同的目录，再选择清单文件。';
+            p.body.append(form.el, note);
+        },
+
+        pickFile() {
+            return new Promise((resolve) => {
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = '.json,application/json';
+                input.addEventListener('change', () => {
+                    const f = input.files && input.files[0];
+                    if (!f) return resolve(null);
+                    const fr = new FileReader();
+                    fr.onload = () => resolve({ name: f.name, text: String(fr.result) });
+                    fr.onerror = () => resolve(null);
+                    fr.readAsText(f);
+                });
+                input.click();
+            });
+        },
+
+        async run(file, scope) {
+            let inv = null;
+            try { inv = JSON.parse(file.text); }
+            catch (e) { return ui.toast(this.validateMessage('parse'), 'error', 5000); }
+
+            const err = this.validate(inv);
+            if (err) return ui.toast(this.validateMessage(err), 'error', 5000);
+            if (!inv.items.length) return ui.toast(this.validateMessage('empty'), 'warn');
+
+            let built;
+            try { built = await this.build(scope); }
+            catch (e) { return ui.toast('采集当前账号内容失败：' + e.message, 'error'); }
+
+            const rootName = state.path.map((s) => s.name).join('/');
+            const baseline = {
+                id: 'imported', label: `${file.name}（另一账号，${util.ts(inv.at)}）`,
+                at: inv.at, root: { fid: '', name: inv.root.name }, deep: true,
+                count: inv.count, size: inv.size, items: inv.items,
+            };
+            const current = {
+                id: 'current', label: `本账号当前状态 ${util.ts(Date.now())}`,
+                at: Date.now(), root: { fid: state.cwd, name: rootName }, deep: true,
+                count: built.items.length, size: built.items.reduce((s, i) => s + (i.dir ? 0 : i.size), 0),
+                items: snapshot.pack(built.items),
+            };
+
+            const diff = snapshot.compare(baseline, current);
+            // 迁移口径：基准=来源账号，对比=本账号
+            snapshot.showDiff(baseline, current, diff, {
+                title: '跨账号迁移校验结果',
+                labels: {
+                    removed: `本账号缺失 (${diff.removed.length})`,
+                    added: `本账号多出 (${diff.added.length})`,
+                    changed: `内容不一致 (${diff.changed.length})`,
+                    moved: `位置变化 (${diff.moved.length})`,
+                },
+                note: diff.removed.length
+                    ? `有 ${diff.removed.length} 个文件在来源账号存在、本账号没有 —— 迁移可能未完成，建议重新迁移这些文件。`
+                    : '来源账号的文件在本账号中均能找到，迁移完整。',
+            });
+        },
+    };
+
+    /* ======================================================================
      * 7. 运行态（当前目录 / 选中项 / 剪贴板）
      * ==================================================================== */
 
@@ -2902,6 +3194,7 @@ ${warn}
             p.foot.prepend(footInfo);
 
             const render = () => {
+                const vp = viewPref.get(state.cwd);
                 // 面包屑
                 crumb.innerHTML = '';
                 state.path.forEach((seg, i) => {
@@ -2950,6 +3243,14 @@ ${warn}
                 mk('🕘 ' + t('btnHistory'), () => opLog.open());
                 mk('🧾 ' + t('btnSnapshot'), () => snapshot.open());
                 mk('📊 ' + t('btnSpace'), () => spaceReport.open());
+                mk('⇕ ' + viewPref.LABEL[vp.density], () => {
+                    viewPref.set(state.cwd, { density: viewPref.nextDensity(vp.density) });
+                    workspace.render();
+                }, '', `行密度：${viewPref.LABEL[vp.density]}（按目录记忆，点击切换）`);
+                mk((vp.thumb ? '🔲' : '⬜') + ' 缩略图', () => {
+                    viewPref.set(state.cwd, { thumb: !vp.thumb });
+                    workspace.render();
+                }, '', `缩略图：${vp.thumb ? '已开启' : '已关闭'}（按目录记忆，点击切换）`);
 
                 // 列表
                 listBox.innerHTML = '';
@@ -2963,18 +3264,32 @@ ${warn}
                 }
                 const shown = workspace.sortedItems();
                 const sPref = config.get('sortPref', {})[state.cwd] || { key: 'updated_at', order: 'desc' };
+                // 图标元素（缩略图加载失败时回退到它）
+                const iconOf = (row) => {
+                    const ic = document.createElement('span');
+                    ic.textContent = (CATEGORY[row.category] || CATEGORY.other).icon;
+                    return ic;
+                };
                 state.table = ui.table([
                     { key: 'name', label: '名称', render: (v, row) => {
                         const box = document.createElement('div');
                         box.className = 'name';
-                        const ic = document.createElement('span');
-                        ic.textContent = (CATEGORY[row.category] || CATEGORY.other).icon;
-                        if (row.dir) ic.dataset.dir = row.fid;
+                        if (viewPref.shouldThumb(row, vp)) {
+                            const img = document.createElement('img');
+                            img.className = 'qem-thumb';
+                            img.loading = 'lazy';
+                            img.alt = '';
+                            img.src = row.thumbnail;
+                            img.addEventListener('error', () => { img.replaceWith(iconOf(row)); }, { once: true });
+                            box.appendChild(img);
+                        } else {
+                            box.appendChild(iconOf(row));
+                        }
                         const tx = document.createElement('span');
                         tx.className = 'txt';
                         tx.textContent = v;
                         tx.title = v;
-                        box.append(ic, tx);
+                        box.appendChild(tx);
                         return box;
                     } },
                     { key: 'size', label: '大小/数量', align: 'right', render: (v, row) => row.dir ? `${row.include_items || 0} 项` : util.humanSize(v) },
@@ -2984,6 +3299,7 @@ ${warn}
                     selectable: true,
                     onSelectionChange: (rows) => { sel.set(rows.map((r) => r.fid)); workspace.syncFoot(); },
                     maxHeight: 'calc(92vh - 300px)',
+                    density: vp.density,
                     sortKey: sPref.key,
                     sortOrder: sPref.order,
                     onSort: (key, order) => {
@@ -3400,9 +3716,11 @@ ${warn}
             async function run() {
                 Object.assign(insight.filter, f.values);
                 stat.textContent = t('working');
-                if (!pool || f.values.deep !== (insight._poolDeep || false)) {
+                // 目录或深度变了必须重扫，否则会拿上一个目录的数据出结果
+                if (!pool || f.values.deep !== (insight._poolDeep || false) || insight._poolCwd !== state.cwd) {
                     pool = await buildPool();
                     insight._poolDeep = f.values.deep;
+                    insight._poolCwd = state.cwd;
                 }
                 const kw = String(f.values.kw || '').trim().split(/\s+/).filter(Boolean);
                 const ex = String(f.values.exclude || '').trim().split(/\s+/).filter(Boolean);
@@ -4947,7 +5265,11 @@ ${warn}
             let picked = [];
 
             try {
-                rows = await this.fetchList(100);
+                // 多取 1 条用于判断是否存在截断，避免静默漏项
+                const fetched = await this.fetchList(201);
+                const truncated = fetched.length > 200;
+                rows = fetched.slice(0, 200);
+                this._truncated = truncated;
             } catch (e) {
                 info.textContent = '';
                 listBox.innerHTML = `<div class="qem-empty">回收站加载失败：${util.escapeHtml(e.message)}<br><br>` +
@@ -4963,8 +5285,9 @@ ${warn}
             const totalSize = rows.reduce((s, x) => s + x.size, 0);
             const withDays = rows.map((r2) => ({ ...r2, remain: this.remainDays(r2) }));
             const soon = withDays.filter((r2) => r2.remain !== null && r2.remain <= (Number(config.get('trash.warnDays', 3)) || 3));
-            info.innerHTML = `共 <b>${rows.length}</b> 项，合计 <b>${util.humanSize(totalSize)}</b>。` +
-                `回收站默认保留 ${config.get('trash.retentionDays', 30)} 天，过期自动永久删除。` +
+            info.innerHTML = `共 <b>${rows.length}</b>${this._truncated ? '+' : ''} 项，合计 <b>${util.humanSize(totalSize)}</b>` +
+                (this._truncated ? '（仅展示最近 200 条，更早的请在夸克 App 内查看）' : '') +
+                `。回收站默认保留 ${config.get('trash.retentionDays', 30)} 天，过期自动永久删除。` +
                 (soon.length ? `　<span class="qem-tag err">${soon.length} 项即将过期</span>` : '');
 
             listBox.innerHTML = '';
@@ -5097,7 +5420,22 @@ ${warn}
                         { key: 'exportFormat', label: '目录树默认格式', type: 'select', value: c.exportFormat, options: [
                             { value: 'md', label: 'Markdown' }, { value: 'txt', label: '纯文本' }, { value: 'json', label: 'JSON' },
                         ] },
-                    ], () => { Object.assign(config.data, { ...f.values, concurrency: Number(f.values.concurrency), minInterval: Number(f.values.minInterval) }); config.save(); ui.applyTheme(); });
+                        { key: 'density', label: '默认行密度', type: 'select', value: c.view.density,
+                            options: viewPref.DENSITIES.map((d) => ({ value: d, label: viewPref.LABEL[d] })) },
+                        { key: 'thumb', label: '默认显示缩略图', type: 'checkbox', value: c.view.thumb },
+                        { key: 'perDir', label: '视图偏好按目录独立', type: 'checkbox', value: c.view.perDir,
+                            hint: '开启后在工作台点密度/缩略图按钮只改变当前目录；关闭则所有目录统一用上面的默认值' },
+                    ], () => {
+                        const v = { ...f.values };
+                        const view = { density: v.density, thumb: !!v.thumb, perDir: !!v.perDir };
+                        delete v.density; delete v.thumb; delete v.perDir;
+                        v.concurrency = Number(v.concurrency);
+                        v.minInterval = Number(v.minInterval);
+                        Object.assign(config.data, v);
+                        config.data.view = view;
+                        config.save();
+                        ui.applyTheme();
+                    });
                     body.appendChild(f.el);
                 }
 
@@ -5311,6 +5649,8 @@ ${warn}
                     mk('导出配置', () => { util.saveTextFile(`qem_config_${Date.now()}.json`, config.export(), 'application/json'); });
                     mk('配置版本历史', () => { p.close(); cfgHistory.open(); });
                     mk('空间占用分析', () => { p.close(); spaceReport.open(); });
+                    mk('跨账号迁移校验', () => { p.close(); crossCheck.exportFlow(); });
+                    mk('清理目录级视图偏好', () => { viewPref.clearAll(); ui.toast('已清理'); });
                     mk('导入配置', () => {
                         const input = document.createElement('input');
                         input.type = 'file';
@@ -5546,6 +5886,8 @@ ${warn}
             GM_registerMenuCommand('解析分享链接', () => shareTool.parse());
             GM_registerMenuCommand('我的分享', () => shareTool.myList());
             GM_registerMenuCommand('空间占用分析', () => spaceReport.open());
+            GM_registerMenuCommand('跨账号校验：导出账号清单', () => crossCheck.exportFlow());
+            GM_registerMenuCommand('跨账号校验：导入并比对', () => crossCheck.compareFlow());
             GM_registerMenuCommand('配置版本历史', () => cfgHistory.open());
             GM_registerMenuCommand('回收站', () => trash.open());
             GM_registerMenuCommand('设置', () => settings.open());
@@ -5590,7 +5932,7 @@ ${warn}
                 version: VERSION,
                 config, api, guard, breaker, EP, util, fileModel, scanner, indexCache, ui,
                 renameRules, parseSize, nameSimilarity,
-                opLog, conflict, capacityGuard, snapshot, cfgHistory, spaceReport, deleteWithUndo,
+                opLog, conflict, capacityGuard, snapshot, cfgHistory, spaceReport, deleteWithUndo, crossCheck, viewPref,
                 workspace, dedup, cleanup, exporter, shareTool, trash, settings,
                 downloader, player, imgSearch, insight, preview, property, picker, state, sel,
             };
