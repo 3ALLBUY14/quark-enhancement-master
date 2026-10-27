@@ -74,6 +74,7 @@ let recycleFixture = null;     // 覆盖回收站返回（测试临期预警用�
 let renameFailsOn = [];        // 这些 fid 的重命名请求返回失败
 let deleteFailsOn = [];        // 命中这些 fid 的删除请求整片失败
 let listFailsOn = [];          // 这些 pdir 的列表请求返回失败（模拟目录已删除）
+let moveFailsOn = [];          // 目标目录命中这些 fid 的移动请求失败
 // 缩略图占位（脱敏：纯色 SVG，非真实素材）
 const THUMB_DATA = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2240%22 height=%2240%22%3E%3Crect width=%2240%22 height=%2240%22 fill=%22%230067c0%22/%3E%3C/svg%3E';
 const FLAT = {};
@@ -125,7 +126,16 @@ function stubFetch(url, init) {
         deleted.push(...(body.filelist || []));
         return ok({});
     }
-    if (u.includes('/file/move')) return ok({});
+    if (u.includes('/file/move')) {
+        const body = JSON.parse((init && init.body) || '{}');
+        if (moveFailsOn.includes(body.to_pdir_fid)) {
+            return Promise.resolve({
+                ok: true, status: 200,
+                json: () => Promise.resolve({ status: 500, code: 23011, message: '模拟移动失败' }),
+            });
+        }
+        return ok({});
+    }
     if (u.includes('/file/download')) {
         const body = JSON.parse((init && init.body) || '{}');
         return ok((body.fids || []).map((fid, i) => ({
@@ -1389,9 +1399,13 @@ check('规则：非法字符被清理', () => !/[\\/:*?"<>|]/.test(Q.renameRules
         // ③ 重命名失败 → 落账 → 重试（仍失败保留 / 成功后移除）
         Q.failLog.clear();
         renameFailsOn = ['f_a'];
-        const fails = await Q.api.renameMany([{ fid: 'f_a', file_name: '新A.mkv' }, { fid: 'f_c', file_name: '新C.mp4' }]);
+        const rn = await Q.api.renameMany([{ fid: 'f_a', file_name: '新A.mkv' }, { fid: 'f_c', file_name: '新C.mp4' }]);
+        const fails = rn.fails;
         check('renameMany：返回失败明细与原因', () => expect(
             fails.length === 1 && fails[0].fid === 'f_a' && !!fails[0].error, JSON.stringify(fails)));
+        check('renameMany：返回结构含进度与停止标记', () => expect(
+            rn.done === 2 && rn.total === 2 && rn.stopped === false,
+            JSON.stringify({ done: rn.done, total: rn.total, stopped: rn.stopped })));
 
         const b = Q.failLog.push({
             action: 'rename',
@@ -1702,6 +1716,149 @@ check('规则：非法字符被清理', () => !/[\\/:*?"<>|]/.test(Q.renameRules
             && !!(Q.state.ui && Q.state.ui.el && Q.state.ui.el.isConnected)
             && Q.state.cwd === 'd_1',
             `关闭前=${wasClosed} 跳转=${jumped} cwd=${Q.state.cwd}`));
+    }
+
+    /* ---------------- 长任务可取消（v0.2.0） ---------------- */
+
+    {
+        // ① 进度面板：只有 cancellable 才给取消按钮，且点击必须真的置位停止信号
+        const p1 = Q.ui.progress('测试进度');
+        const mask1 = lastMask();
+        const hasBtn1 = mask1 ? Array.from(mask1.querySelectorAll('.qem-foot button')).some((b) => b.textContent.includes('取消')) : false;
+        check('进度面板：默认不提供取消按钮', () => expect(
+            !hasBtn1 && p1.cancelled === false && p1.shouldStop() === false,
+            `有按钮=${hasBtn1} cancelled=${p1.cancelled}`));
+        p1.close();
+        await tick(30);
+
+        const p2 = Q.ui.progress('测试进度', { cancellable: true });
+        const mask2 = lastMask();
+        const cBtn = mask2 ? Array.from(mask2.querySelectorAll('.qem-foot button')).find((b) => b.textContent.includes('取消')) : null;
+        check('进度面板：cancellable 时提供取消按钮', () => expect(!!cBtn, '未找到取消按钮'));
+        if (cBtn) cBtn.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+        check('进度面板：点击取消后停止信号为真', () => expect(
+            p2.cancelled === true && p2.shouldStop() === true));
+        check('进度面板：取消按钮点一次即禁用（防重复点）', () => expect(
+            !!cBtn && cBtn.disabled === true));
+        p2.close();
+        await tick(30);
+    }
+
+    {
+        // ② renameMany：中途停止，未处理的项不计入失败
+        Q.breaker.reset();
+        renameFailsOn = [];
+        const pairs = Array.from({ length: 6 }, (_, i) => ({ fid: 'f_' + i, file_name: 'n' + i + '.mkv' }));
+        let cb = 0;
+        const r = await Q.api.renameMany(pairs, () => { cb++; }, { shouldStop: () => cb >= 2, gap: 5 });
+        check('renameMany 取消：按进度停止且不误记失败', () => expect(
+            r.stopped === true && r.done === 2 && r.total === 6 && r.fails.length === 0,
+            JSON.stringify({ done: r.done, total: r.total, stopped: r.stopped, fails: r.fails.length })));
+    }
+
+    {
+        // ③ removeChunkedSafe：在分片之间停止，已完成的分片照常返回
+        Q.breaker.reset();
+        deleted.length = 0;
+        deleteFailsOn = [];
+        const fids = Array.from({ length: 5 }, (_, i) => 'c' + i);
+        let n = 0;
+        const res = await Q.api.removeChunkedSafe(fids, 1, () => { n++; }, { shouldStop: () => n >= 2 });
+        check('分片删除取消：保留已完成分片、剩余不处理', () => expect(
+            res.stopped === true && res.ok.length === 2 && res.total === 5 && res.fails.length === 0,
+            JSON.stringify({ ok: res.ok.length, total: res.total, stopped: res.stopped })));
+        check('分片删除取消：已完成项确实已删除', () => expect(
+            deleted.filter((f) => f.startsWith('c')).length === 2, deleted.join(',')));
+    }
+
+    {
+        // ④ deleteWithUndo：取消后成功项仍进撤销栈，且不把未执行项记成失败
+        await Q.workspace.reload('0');
+        Q.failLog.clear();
+        deleted.length = 0;
+        const items = Array.from({ length: 101 }, (_, i) => ({ fid: 'u' + i, name: 'u' + i, size: 0, pdir_fid: '0' }));
+        let c = 0;
+        const n = await Q.deleteWithUndo(items, {
+            label: '取消删除测试',
+            skipStaleCheck: true,
+            onProgress: () => { c++; },
+            shouldStop: () => c >= 1,
+        });
+        check('删除取消：返回已成功数而非总数', () => expect(n === 100, `n=${n}（应 100）`));
+
+        const rec = Q.opLog.list()[0];
+        check('删除取消：成功项进入撤销栈', () => expect(
+            !!rec && rec.type === 'delete' && rec.entries.length === 100,
+            `条目=${rec && rec.entries.length}`));
+        check('删除取消：撤销备注注明已取消与未执行数', () => expect(
+            !!rec && /已取消/.test(rec.note || '') && /未执行/.test(rec.note || ''),
+            rec && rec.note));
+        check('删除取消：未执行项不记入失败账本', () => expect(
+            Q.failLog.itemCount() === 0, `失败项=${Q.failLog.itemCount()}`));
+    }
+
+    {
+        // ⑤ 全部取消（一片都没成功）时应返回 0，不产生虚假的撤销记录
+        Q.breaker.reset();
+        deleted.length = 0;
+        const items = Array.from({ length: 3 }, (_, i) => ({ fid: 'v' + i, name: 'v' + i, size: 0, pdir_fid: '0' }));
+        const beforeCount = Q.opLog.list().length;
+        const n = await Q.deleteWithUndo(items, {
+            label: '全取消测试', skipStaleCheck: true, shouldStop: () => true,
+        });
+        check('删除取消：一开始就取消则不执行并返回 0', () => expect(
+            n === 0 && deleted.length === 0, `n=${n} 已删=${deleted.length}`));
+        check('删除取消：无成功项时不写入撤销栈', () => expect(
+            Q.opLog.list().length === beforeCount, `记录数 ${beforeCount} → ${Q.opLog.list().length}`));
+    }
+
+    {
+        // ⑥ 撤销取消：如实留痕为「部分撤销」，并停止再撤入口（避免二次施加）
+        Q.breaker.reset();
+        Q.opLog.push({
+            type: 'delete', label: '可取消撤销测试',
+            entries: Array.from({ length: 201 }, (_, i) => ({ fid: 'w' + i, name: 'w' + i, recycleFid: 'rc' + i })),
+        });
+        const rec = Q.opLog.list()[0];
+        const p = Q.opLog.undo(rec.id);
+        await clickFoot('撤销');   // 确认弹窗
+        await clickFoot('取消');   // 进度面板上的取消
+        const done = await p;
+        const after = Q.opLog.list().find((r) => r.id === rec.id);
+        check('撤销取消：返回成功并记录为部分撤销', () => expect(
+            done === true && !!after && after.undone === true && /部分撤销/.test(after.note || ''),
+            `done=${done} undone=${after && after.undone} 备注=${after && after.note}`));
+    }
+
+    {
+        // ⑦ 撤销取消时，「取消前已经发生的失败」不能跟着被丢掉
+        //    拉大请求间隔，让取消确定落在第 1 组失败之后、第 2 组之前
+        Q.config.set('minInterval', 200);
+        Q.breaker.reset();
+        Q.failLog.clear();
+        moveFailsOn = ['pdir_bad'];
+        Q.opLog.push({
+            type: 'move', label: '可取消撤销（移动）',
+            entries: [
+                { fid: 'm1', name: 'm1', pdir: 'pdir_bad' },
+                { fid: 'm2', name: 'm2', pdir: 'pdir_ok1' },
+                { fid: 'm3', name: 'm3', pdir: 'pdir_ok2' },
+            ],
+        });
+        const rec2 = Q.opLog.list()[0];
+        const p2 = Q.opLog.undo(rec2.id);
+        await clickFoot('撤销');
+        await tick(50);
+        await clickFoot('取消');
+        const done2 = await p2;
+        moveFailsOn = [];
+        Q.config.set('minInterval', 120);
+
+        const after2 = Q.opLog.list().find((r) => r.id === rec2.id);
+        const fb2 = Q.failLog.list()[0];
+        check('撤销取消：取消前的失败仍写入失败账本', () => expect(
+            done2 === true && /部分撤销/.test(after2.note || '') && !!fb2 && fb2.items.length === 1,
+            `备注=${after2 && after2.note} 失败项=${fb2 ? fb2.items.length : 0}`));
     }
 
     /* ---------------- 结果 ---------------- */

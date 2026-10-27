@@ -2,10 +2,10 @@
 // @name               夸克增强大师
 // @name:en            Quark Enhancement Master
 // @namespace          https://github.com/3ALLBUY14/quark-enhancement-master
-// @version            0.1.9
+// @version            0.2.0
 // @author             Quark port / 原版 PikPak Enhancement Master by digbug82
 // @license            AGPL-3.0-or-later
-// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、目录筛选与全盘搜索、键盘导航、失败明细与重试、常用目录书签与前进后退、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
+// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、目录筛选与全盘搜索、键盘导航、失败明细与重试、常用目录书签与前进后退、长任务可取消、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
 // @description:en     Quark Drive enhancement: batch rename, file/folder dedup, cleanup, directory-tree export, M3U export, magnet extraction, file insight/filter, sorting, direct-link export with Aria2/IDM, PotPlayer launcher, batch share & share-import, recycle bin, reverse image search, config backup.
 // @homepage           https://github.com/3ALLBUY14/quark-enhancement-master
 // @match              https://pan.quark.cn/*
@@ -60,7 +60,7 @@
      * 0. 常量
      * ==================================================================== */
 
-    const VERSION = '0.1.9';
+    const VERSION = '0.2.0';
     const LS_CFG = 'qem_cfg_v1';
     const LS_CACHE_PREFIX = 'qem_cache_';
     const ROOT_FID = '0';
@@ -1071,7 +1071,11 @@
         },
 
         /** 带实时进度的长任务弹窗 */
-        progress(title) {
+        /**
+         * 进度面板。cancellable=true 时自带「取消」按钮，并把 shouldStop()
+         * 交给批量接口——取消必须真的能停，而不是只把文案改成「正在停止」。
+         */
+        progress(title, { cancellable = false } = {}) {
             const p = this.panel({ title, size: 'sm', closeOnMask: false, buttons: [] });
             const wrap = document.createElement('div');
             wrap.className = 'col';
@@ -1085,7 +1089,7 @@
             wrap.append(text, bar);
             p.body.appendChild(wrap);
             let cancelled = false;
-            return {
+            const api = {
                 el: p.el,
                 set(ratio, msg) {
                     fill.style.width = Math.max(0, Math.min(1, ratio || 0)) * 100 + '%';
@@ -1093,15 +1097,25 @@
                 },
                 text(msg) { text.textContent = msg; },
                 get cancelled() { return cancelled; },
+                /** 供批量接口作为停止信号使用 */
+                shouldStop: () => cancelled,
                 cancelBtn() {
+                    if (api._hasCancel) return;
+                    api._hasCancel = true;
                     const btn = document.createElement('button');
                     btn.textContent = t('cancel');
-                    btn.addEventListener('click', () => { cancelled = true; text.textContent = '正在停止...'; });
+                    btn.addEventListener('click', () => {
+                        cancelled = true;
+                        btn.disabled = true;
+                        text.textContent = '正在停止（已完成的部分会照常记录，可撤销）...';
+                    });
                     p.foot.style.display = '';
                     p.foot.appendChild(btn);
                 },
                 close() { p.close(); },
             };
+            if (cancellable) api.cancelBtn();
+            return api;
         },
 
         /** 结果表格：columns = [{key,label,render?,align?,sortable?,width?}] */
@@ -1627,12 +1641,14 @@
          * （成功 → 撤销栈，失败 → 失败账本）。整片失败时按「片内全失败」处理：
          * 宁可少记可撤销项，也不虚报成功。
          */
-        async removeChunkedSafe(fids, chunk = 100, onProgress = null) {
+        async removeChunkedSafe(fids, chunk = 100, onProgress = null, { shouldStop = null } = {}) {
             const list = [].concat(fids).filter(Boolean);
             const ok = [];
             const fails = [];
             let done = 0;
+            let stopped = false;
             for (let i = 0; i < list.length; i += chunk) {
+                if (shouldStop && shouldStop()) { stopped = true; break; }   // 分片之间停，不留半片状态
                 const part = list.slice(i, i + chunk);
                 try {
                     await this.remove(part, { silent: true });
@@ -1643,19 +1659,28 @@
                 done = Math.min(list.length, i + chunk);
                 if (onProgress) onProgress(done, list.length);
             }
-            return { ok, fails };
+            return { ok, fails, done, total: list.length, stopped };
         },
 
-        async renameMany(pairs, onProgress = null) {
-            let done = 0;
+        /**
+         * 逐个重命名，支持中途停止。
+         * @param shouldStop 返回 true 时停止（已处理的项不受影响）
+         * @returns {{fails:Array, done:number, total:number, stopped:boolean}}
+         */
+        async renameMany(pairs, onProgress = null, { shouldStop = null, gap = 40 } = {}) {
+            const total = pairs.length;
             const fails = [];
+            let done = 0;
+            let stopped = false;
             for (const p of pairs) {
-                try { await this.rename(p.fid, p.file_name, { silent: true }); } catch (e) { fails.push({ ...p, error: e.message }); }
+                if (shouldStop && shouldStop()) { stopped = true; break; }
+                try { await this.rename(p.fid, p.file_name, { silent: true }); }
+                catch (e) { fails.push({ ...p, error: e.message }); }
                 done++;
-                if (onProgress) onProgress(done, pairs.length);
-                await util.sleep(40);
+                if (onProgress) onProgress(done, total);
+                if (done < total) await util.sleep(gap);
             }
-            return fails;
+            return { fails, done, total, stopped };
         },
 
         async downloadUrls(fids) {
@@ -1926,14 +1951,19 @@
             );
             if (!ok) return false;
 
-            const pr = ui.progress('正在撤销');
+            const pr = ui.progress('正在撤销', { cancellable: true });
             try {
                 let fails = [];
+                let stopped = false;
+                let doneCount = 0;
+                let totalCount = 0;
                 if (rec.type === 'rename') {
-                    fails = await api.renameMany(
-                        rec.entries.filter((e) => e.before).map((e) => ({ fid: e.fid, file_name: e.before })),
-                        (d, tt) => pr.set(d / tt, `已恢复 ${d} / ${tt}`),
-                    );
+                    const pairs = rec.entries.filter((e) => e.before).map((e) => ({ fid: e.fid, file_name: e.before }));
+                    const r = await api.renameMany(pairs, (d, tt) => pr.set(d / tt, `已恢复 ${d} / ${tt}`), { shouldStop: pr.shouldStop });
+                    fails = r.fails;
+                    stopped = r.stopped;
+                    doneCount = r.done;
+                    totalCount = r.total;
                 } else if (rec.type === 'move') {
                     // 按原父目录分组回移
                     const groups = new Map();
@@ -1944,31 +1974,42 @@
                     });
                     let done = 0;
                     const total = rec.entries.length;
+                    totalCount = total;
                     for (const [pdir, fids] of groups) {
+                        if (pr.cancelled) { stopped = true; break; }
                         try { await api.move(fids, pdir); } catch (err) { fails.push({ fid: fids.join(','), error: err.message }); }
                         done += fids.length;
+                        doneCount = done;
                         pr.set(done / total, `已回移 ${done} / ${total}`);
                     }
                 } else if (rec.type === 'delete') {
                     const pairs = (rec.entries || []).filter((e) => e.recycleFid);
                     if (!pairs.length) throw new Error('未记录到回收站条目，无法自动还原，请到「回收站」手动还原');
                     let done = 0;
+                    totalCount = pairs.length;
                     for (let i = 0; i < pairs.length; i += 100) {
+                        if (pr.cancelled) { stopped = true; break; }
                         const chunk = pairs.slice(i, i + 100);
                         await api.raw('recycleRestore', { filelist: chunk.map((x) => x.recycleFid) });
                         done += chunk.length;
+                        doneCount = done;
                         pr.set(done / pairs.length, `已还原 ${done} / ${pairs.length}`);
                     }
                 } else if (rec.type === 'save') {
                     const fids = (rec.createdFids || []).filter(Boolean);
                     if (!fids.length) throw new Error('未记录到转存生成的文件，无法自动撤销，请手动删除');
-                    await api.removeChunked(fids, 100, (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`));
+                    const res = await api.removeChunkedSafe(fids, 100, (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`), { shouldStop: pr.shouldStop });
+                    stopped = res.stopped;
+                    doneCount = res.ok.length;
+                    totalCount = fids.length;
+                    if (res.fails.length) fails.push(...res.fails);
                 } else {
                     throw new Error('该操作类型不支持撤销');
                 }
 
                 pr.close();
                 this.markUndone(rec.id);
+                // 取消前已经发生的失败同样要落账：不能因为「整体被取消」就把已失败的项丢掉
                 if (fails.length) {
                     failLog.push({
                         action: 'manual',
@@ -1981,6 +2022,15 @@
                         })),
                         note: '撤销过程中的失败需手动处理（文件可能已被其他操作改动）',
                     });
+                }
+                if (stopped) {
+                    // 取消后不再提供"再撤一次"入口：对已完成部分二次施加会产生不可预期的副作用，
+                    // 因此这里把记录标记为已撤销，并把未处理数量如实写进备注。
+                    const partialNote = `部分撤销：完成 ${doneCount} / ${totalCount} 项后取消，剩余项需手动核对`
+                        + (fails.length ? `；另有 ${fails.length} 项失败（见失败记录）` : '');
+                    this.persist(this.list().map((r) => (r.id === rec.id ? { ...r, note: partialNote } : r)));
+                    ui.toast(partialNote + '（详见操作历史）', 'warn', 6500);
+                } else if (fails.length) {
                     ui.toast(`撤销完成，但 ${fails.length} 项失败（可能已被其他操作改动，详见失败记录）`, 'warn', 6000);
                 } else {
                     ui.toast(`已撤销「${rec.label}」`);
@@ -2697,7 +2747,7 @@ ${warn}
         return ui.toast(okText);
     }
 
-    async function deleteWithUndo(items, { label = '批量删除', onProgress = null, skipStaleCheck = false } = {}) {
+    async function deleteWithUndo(items, { label = '批量删除', onProgress = null, skipStaleCheck = false, shouldStop = null } = {}) {
         const list = (items || []).filter((i) => i && i.fid);
         if (!list.length) return 0;
 
@@ -2711,9 +2761,10 @@ ${warn}
             if (!go) return 0;
         }
 
-        const res = await api.removeChunkedSafe(list.map((i) => i.fid), 100, onProgress);
+        const res = await api.removeChunkedSafe(list.map((i) => i.fid), 100, onProgress, { shouldStop });
         const okSet = new Set(res.ok);
         const done = list.filter((i) => okSet.has(i.fid));
+        const unexecuted = Math.max(0, list.length - res.done);
 
         // 关键：某一片失败时，前面已删成功的文件必须照常进撤销栈，否则「删了却撤不回」
         if (res.fails.length) {
@@ -2725,8 +2776,11 @@ ${warn}
                     fid: i.fid, name: i.name, size: i.size, pdir: i.pdir_fid,
                     error: failMap.get(i.fid),
                 })),
-                note: `${done.length}/${list.length} 项已成功删除`,
+                note: `${done.length}/${list.length} 项已成功删除` + (res.stopped ? `，已取消（${unexecuted} 项未执行）` : ''),
             });
+        }
+        if (res.stopped) {
+            ui.toast(`已取消删除：成功 ${done.length} 项，未执行 ${unexecuted} 项`, 'warn', 5000);
         }
         if (!done.length) return 0;
 
@@ -2747,6 +2801,9 @@ ${warn}
         }
         if (res.fails.length) {
             note = (note ? note + '；' : '') + `${res.fails.length} 项删除失败，已记入「失败记录」`;
+        }
+        if (res.stopped) {
+            note = (note ? note + '；' : '') + `操作已取消，${unexecuted} 项未执行`;
         }
         opLog.push({ type: 'delete', label, entries, undoable, note });
         capacityGuard.invalidate();
@@ -3154,9 +3211,9 @@ ${warn}
                         const total = targets.reduce((s, x) => s + x.size, 0);
                         const ok = await ui.confirm(`将最大的 ${targets.length} 个文件移入回收站，合计 ${util.humanSize(total)}。\n删除后可通过「撤销」还原。是否继续？`, { danger: true, okText: '移入回收站' });
                         if (!ok) return;
-                        const pr = ui.progress('删除中');
+                        const pr = ui.progress('删除中', { cancellable: true });
                         try {
-                            const n = await deleteWithUndo(targets, { label: '空间分析批量删除', onProgress: (d2, t2) => pr.set(d2 / t2, `已删除 ${d2}/${t2}`) });
+                            const n = await deleteWithUndo(targets, { label: '空间分析批量删除', onProgress: (d2, t2) => pr.set(d2 / t2, `已删除 ${d2}/${t2}`), shouldStop: pr.shouldStop });
                             pr.close();
                             toastDeleted(n, `已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
                             p.close(); spaceReport.open();
@@ -3843,9 +3900,9 @@ ${warn}
                     if (!list.length) return ui.toast(t('noSelection'), 'warn');
                     const ok = await ui.confirm(`将把 ${list.length} 个项目移入回收站，可稍后撤销。是否继续？`, { danger: true, okText: '移入回收站' });
                     if (!ok) return;
-                    const pr = ui.progress('删除中');
+                    const pr = ui.progress('删除中', { cancellable: true });
                     try {
-                        const n = await deleteWithUndo(list, { label: '搜索结果删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`) });
+                        const n = await deleteWithUndo(list, { label: '搜索结果删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`), shouldStop: pr.shouldStop });
                         pr.close();
                         toastDeleted(n, `已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
                         p.close();
@@ -3957,15 +4014,20 @@ ${warn}
                 return n;
             }
 
-            const pr = ui.progress('重试中');
+            const pr = ui.progress('重试中', { cancellable: true });
             try {
                 if (b.action === 'rename') {
                     const pairs = b.items.filter((i) => i.file_name).map((i) => ({ fid: i.fid, file_name: i.file_name }));
                     if (!pairs.length) { pr.close(); return ui.toast('该批次缺少重命名参数，无法自动重试', 'warn'); }
-                    const fails = await api.renameMany(pairs, (d, tt) => pr.set(d / tt, `已重试 ${d} / ${tt}`));
+                    const r = await api.renameMany(pairs, (d, tt) => pr.set(d / tt, `已重试 ${d} / ${tt}`), { shouldStop: pr.shouldStop });
                     pr.close();
-                    const failMap = new Map(fails.map((f) => [f.fid, f.error]));
-                    this._settle(b, b.items.filter((i) => failMap.has(i.fid)).map((i) => ({ ...i, error: failMap.get(i.fid) })));
+                    if (r.stopped) {
+                        // 未处理的项仍是失败项，保持批次原样，避免丢失信息
+                        ui.toast(`重试已取消：处理 ${r.done} / ${r.total} 项，批次保持不变`, 'warn', 5000);
+                    } else {
+                        const failMap = new Map(r.fails.map((f) => [f.fid, f.error]));
+                        this._settle(b, b.items.filter((i) => failMap.has(i.fid)).map((i) => ({ ...i, error: failMap.get(i.fid) })));
+                    }
                 } else if (b.action === 'move') {
                     const to = b.meta && b.meta.toPdir;
                     if (!to) { pr.close(); return ui.toast('该批次缺少目标目录，无法自动重试', 'warn'); }
@@ -5113,9 +5175,9 @@ ${warn}
             if (!items.length) return ui.toast(t('noSelection'), 'warn');
             const ok = await ui.confirm(`将把 ${items.length} 个项目移入回收站，可稍后还原。是否继续？`, { danger: true, okText: '移入回收站' });
             if (!ok) return;
-            const pr = ui.progress('删除中');
+            const pr = ui.progress('删除中', { cancellable: true });
             try {
-                const n = await deleteWithUndo(items, { label: '批量删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`) });
+                const n = await deleteWithUndo(items, { label: '批量删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`), shouldStop: pr.shouldStop });
                 pr.close();
                 toastDeleted(n, `已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
                 await workspace.reload();
@@ -5467,9 +5529,9 @@ ${warn}
                 mk(`删除命中项（${matched.length}）`, async () => {
                     const ok = await ui.confirm(`将把命中的 ${matched.length} 个项目移入回收站，是否继续？`, { danger: true, okText: '移入回收站' });
                     if (!ok) return;
-                    const pr = ui.progress('删除中');
+                    const pr = ui.progress('删除中', { cancellable: true });
                     try {
-                        const n = await deleteWithUndo(matched, { label: '文件透视删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`) });
+                        const n = await deleteWithUndo(matched, { label: '文件透视删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`), shouldStop: pr.shouldStop });
                         pr.close(); toastDeleted(n, `已移入回收站 ${n} 项`);
                         pool = null; await run(); await workspace.reload();
                     } catch (e) { pr.close(); ui.toast('失败：' + e.message, 'error'); }
@@ -5715,17 +5777,21 @@ ${warn}
                 });
                 const ok = await ui.confirm(`即将重命名 ${rows.length} 个项目，此操作会直接修改网盘文件名。是否继续？`);
                 if (!ok) return;
-                const pr = ui.progress('重命名中');
-                pr.cancelBtn();
+                const pr = ui.progress('重命名中', { cancellable: true });
                 try {
-                    const fails = await api.renameMany(rows.map((r) => ({ fid: r.fid, file_name: r.final })), (d, tt) => pr.set(d / tt, `已处理 ${d} / ${tt}`));
-                    const okRows = rows.filter((r) => !fails.some((f) => f.fid === r.fid));
+                    const res = await api.renameMany(
+                        rows.map((x) => ({ fid: x.fid, file_name: x.final })),
+                        (d, tt) => pr.set(d / tt, `已处理 ${d} / ${tt}`),
+                        { shouldStop: pr.shouldStop },
+                    );
+                    const fails = res.fails;
+                    const okRows = rows.filter((x) => !fails.some((f) => f.fid === x.fid));
                     if (okRows.length) {
                         opLog.push({
                             type: 'rename',
                             label: '批量重命名',
-                            entries: okRows.map((r) => ({ fid: r.fid, name: r.next, before: r.old, after: r.final || r.next })),
-                            note: fails.length ? `${fails.length} 项失败未记录` : '',
+                            entries: okRows.map((x) => ({ fid: x.fid, name: x.next, before: x.old, after: x.final || x.next })),
+                            note: [fails.length ? `${fails.length} 项失败未记录` : '', res.stopped ? '操作已取消' : ''].filter(Boolean).join('；'),
                         });
                     }
                     pr.close();
@@ -5734,16 +5800,18 @@ ${warn}
                             action: 'rename',
                             label: '批量重命名',
                             items: fails.map((f) => {
-                                const row = rows.find((r) => r.fid === f.fid);
+                                const row = rows.find((x) => x.fid === f.fid);
                                 return { fid: f.fid, name: (row && row.old) || f.file_name || '', file_name: f.file_name, error: f.error };
                             }),
-                            note: `${okRows.length}/${rows.length} 项已重命名`,
+                            note: `${okRows.length}/${rows.length} 项已重命名` + (res.stopped ? '，已取消' : ''),
                         });
                     }
-                    if (fails.length) {
-                        ui.toast(`完成 ${rows.length - fails.length} 项，失败 ${fails.length} 项（可查看失败记录并重试）`, 'warn', 5000);
+                    if (res.stopped) {
+                        ui.toast(`已取消：完成 ${res.done} / ${res.total} 项，剩余 ${res.total - res.done} 项未处理`, 'warn', 6000);
+                    } else if (fails.length) {
+                        ui.toast(`完成 ${res.done} 项，失败 ${fails.length} 项（可查看失败记录并重试）`, 'warn', 5000);
                     } else {
-                        ui.toast(`已重命名 ${rows.length} 项`);
+                        ui.toast(`已重命名 ${res.done} 项`);
                     }
                     await workspace.reload();
                 } catch (e) { pr.close(); ui.toast('重命名失败：' + e.message, 'error'); }
@@ -5926,10 +5994,10 @@ ${warn}
                 delBtn.addEventListener('click', async () => {
                     const ok = await ui.confirm(`将把 ${totalDupes} 个冗余文件移入回收站，保留每组中的「保留」项。\n若判定有误，可在回收站还原。是否继续？`, { danger: true, okText: '移入回收站' });
                     if (!ok) return;
-                    const pr = ui.progress('删除中');
+                    const pr = ui.progress('删除中', { cancellable: true });
                     try {
                         const dupes = groups.flatMap((g) => g.dupes);
-                        const n = await deleteWithUndo(dupes, { label: '查重清理', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`) });
+                        const n = await deleteWithUndo(dupes, { label: '查重清理', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`), shouldStop: pr.shouldStop });
                         pr.close(); toastDeleted(n, `已清理 ${n} 个冗余文件`);
                         await workspace.reload();
                     } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
@@ -6174,9 +6242,9 @@ ${warn}
                 del.addEventListener('click', async () => {
                     const ok = await ui.confirm(`将把 ${results.length} 个项目移入回收站，是否继续？`, { danger: true, okText: '移入回收站' });
                     if (!ok) return;
-                    const pr3 = ui.progress('删除中');
+                    const pr3 = ui.progress('删除中', { cancellable: true });
                     try {
-                        const n = await deleteWithUndo(results, { label: '资源清理', onProgress: (d, tt) => pr3.set(d / tt, `已删除 ${d}/${tt}`) });
+                        const n = await deleteWithUndo(results, { label: '资源清理', onProgress: (d, tt) => pr3.set(d / tt, `已删除 ${d}/${tt}`), shouldStop: pr3.shouldStop });
                         pr3.close(); toastDeleted(n, `已清理 ${n} 项`);
                         indexCache.dropAll();
                         await workspace.reload();
