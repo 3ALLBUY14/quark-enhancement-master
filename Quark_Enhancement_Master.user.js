@@ -2,10 +2,10 @@
 // @name               夸克增强大师
 // @name:en            Quark Enhancement Master
 // @namespace          https://github.com/3ALLBUY14/quark-enhancement-master
-// @version            0.1.6
+// @version            0.1.7
 // @author             Quark port / 原版 PikPak Enhancement Master by digbug82
 // @license            AGPL-3.0-or-later
-// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
+// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、目录筛选与全盘搜索、键盘导航、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
 // @description:en     Quark Drive enhancement: batch rename, file/folder dedup, cleanup, directory-tree export, M3U export, magnet extraction, file insight/filter, sorting, direct-link export with Aria2/IDM, PotPlayer launcher, batch share & share-import, recycle bin, reverse image search, config backup.
 // @homepage           https://github.com/3ALLBUY14/quark-enhancement-master
 // @match              https://pan.quark.cn/*
@@ -60,7 +60,7 @@
      * 0. 常量
      * ==================================================================== */
 
-    const VERSION = '0.1.6';
+    const VERSION = '0.1.7';
     const LS_CFG = 'qem_cfg_v1';
     const LS_CACHE_PREFIX = 'qem_cache_';
     const ROOT_FID = '0';
@@ -749,6 +749,39 @@
 .qem-toolbar button.danger { color: var(--err); }
 .qem-toolbar button.danger:hover { background: var(--err-soft); border-color: var(--err); }
 .qem-sep { width: 1px; height: 22px; background: var(--bd-2); margin: 0 2px; flex: 0 0 auto; }
+
+/* —— 搜索条（当前目录筛选 + 全盘搜索入口） —— */
+.qem-search {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 7px 10px; background: var(--bg-1);
+  border: 1px solid var(--bd); border-radius: var(--r-lg);
+  transition: border-color .12s, background .12s;
+}
+.qem-search.on { border-color: var(--pri-bd); background: var(--pri-soft); }
+.qem-search .box { position: relative; flex: 1; min-width: 180px; display: flex; align-items: center; }
+.qem-search .box input { padding-left: 28px; padding-right: 28px; }
+.qem-search .box .ico { position: absolute; left: 9px; font-size: 12px; color: var(--fg-3); pointer-events: none; }
+.qem-search .box .clr {
+  position: absolute; right: 4px; width: 20px; height: 20px; padding: 0;
+  border: none; background: transparent; color: var(--fg-3);
+  font-size: 12px; line-height: 1; border-radius: 50%; display: none;
+}
+.qem-search .box .clr.on { display: block; }
+.qem-search .box .clr:hover { background: var(--bg-3); color: var(--fg); }
+.qem-search .stat { font-size: 12px; font-weight: 600; color: var(--pri); white-space: nowrap; }
+.qem-search .hint { font-size: 11.5px; color: var(--fg-3); white-space: nowrap; }
+.qem-search > button { font-size: 12.5px; padding: 4px 10px; }
+
+/* 搜索命中高亮 */
+.qem-table mark.qem-hl { background: #ffe9a8; color: inherit; padding: 0 1px; border-radius: 2px; }
+.qem-dark .qem-table mark.qem-hl { background: rgba(255,205,80,.26); color: var(--fg); }
+/* 键盘游标行 */
+.qem-table tbody tr.cur { outline: 2px solid var(--pri); outline-offset: -2px; }
+
+@media (max-width: 720px) {
+  .qem-search .hint { display: none; }
+  .qem-search .box { min-width: 120px; }
+}
 
 /* —— 内容区（带边框的内容卡，框出列表区域） —— */
 .qem-content { border: 1px solid var(--bd); border-radius: var(--r-lg); background: var(--bg-0); overflow: hidden; }
@@ -1501,6 +1534,31 @@
                 page++;
             }
             return { items: out, total: Number.isFinite(total) ? total : out.length };
+        },
+
+        /** 全盘搜索（按文件名）：翻页取到 max 为止，按 fid 去重 */
+        async searchAll(q, { max = 300, size = PAGE_SIZE, onProgress = null } = {}) {
+            const kw = String(q || '').trim();
+            if (!kw) return { items: [], total: 0 };
+            const out = [];
+            const seen = new Set();
+            let page = 1;
+            let total = Infinity;
+            while (out.length < total && out.length < max) {
+                const r = await this.raw('search', { q: kw, page, size });
+                const list = (r.data && r.data.list) || [];
+                total = Number(r.metadata && (r.metadata._total || r.metadata._count)) || list.length;
+                if (!list.length) break;
+                list.map(fileModel.normalize).forEach((it) => {
+                    if (!it.fid || seen.has(it.fid)) return;
+                    seen.add(it.fid);
+                    out.push(it);
+                });
+                if (onProgress) onProgress(out.length, Math.min(total, max));
+                if (list.length < size) break;
+                page++;
+            }
+            return { items: out.slice(0, max), total: Number.isFinite(total) ? total : out.length };
         },
 
         /* ---------- 基础操作 ---------- */
@@ -3282,6 +3340,438 @@ ${warn}
     };
 
     /* ======================================================================
+     * 6.13 搜索与筛选
+     *      工作台早就有 20+ 个操作入口，却一直没有「找文件」的能力：
+     *      ① 当前目录即时过滤（纯本地，输入即筛，不产生任何请求）
+     *      ② 全盘搜索（走 /file/search，EP 表里早已定义但从未接线）
+     *      parse() 为纯函数且永不抛错，便于单测；match() 不依赖 UI。
+     * ==================================================================== */
+
+    const finder = {
+        /** size: 条件的比较符 */
+        OPS: {
+            '>': (a, b) => a > b, '>=': (a, b) => a >= b,
+            '<': (a, b) => a < b, '<=': (a, b) => a <= b, '=': (a, b) => a === b,
+        },
+
+        /** 类型别名 → 归一化 category */
+        TYPE_ALIAS: {
+            '文件夹': 'folder', folder: 'folder', dir: 'folder', '目录': 'folder',
+            '视频': 'video', video: 'video',
+            '音频': 'audio', audio: 'audio', music: 'audio', '音乐': 'audio',
+            '图片': 'image', image: 'image', photo: 'image', '照片': 'image',
+            '文档': 'doc', doc: 'doc',
+            '压缩': 'zip', '压缩包': 'zip', zip: 'zip',
+            '应用': 'app', app: 'app',
+        },
+
+        /**
+         * 解析查询串：
+         *   空格分词（全部满足）｜"词组"（含空格）｜-词（排除）
+         *   ext:mkv,mp4｜*.mkv｜type:视频｜size:>1gb｜/正则/flags
+         * 非法条件不抛错，降级为普通关键词并记入 notes（供界面提示）。
+         */
+        parse(q) {
+            const parsed = {
+                raw: String(q || '').trim(),
+                keywords: [], words: [], excludes: [], exts: [], types: [], sizes: [], regexes: [], notes: [],
+            };
+            if (!parsed.raw) return parsed;
+
+            // 全角引号归一，便于中文输入法直接使用
+            const raw = parsed.raw.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+            const tokens = raw.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+            const unquote = (s) => s.replace(/^["']|["']$/g, '');
+
+            tokens.forEach((tokRaw) => {
+                let tok = tokRaw;
+                let negate = false;
+                if (tok.length > 1 && tok[0] === '-') { negate = true; tok = tok.slice(1); }
+                const low = tok.toLowerCase();
+
+                if (low.startsWith('ext:')) {
+                    const list = unquote(tok.slice(4)).split(/[,|;]/)
+                        .map((x) => x.trim().toLowerCase().replace(/^\*?\.?/, '')).filter(Boolean);
+                    if (list.length) parsed.exts.push(...list);
+                    else parsed.notes.push('扩展名条件为空');
+                    return;
+                }
+                // 兼容 glob 写法：*.mkv 等同 ext:mkv
+                const glob = /^\*\.([a-z0-9]+)$/i.exec(tok);
+                if (glob) { parsed.exts.push(glob[1].toLowerCase()); return; }
+                if (low.startsWith('type:')) {
+                    const list = unquote(tok.slice(5)).split(/[,|;]/).map((x) => x.trim()).filter(Boolean);
+                    const mapped = list.map((x) => this.TYPE_ALIAS[x.toLowerCase()] || this.TYPE_ALIAS[x]).filter(Boolean);
+                    if (mapped.length) parsed.types.push(...mapped);
+                    else parsed.notes.push(`未知类型「${list.join(',')}」`);
+                    return;
+                }
+                if (low.startsWith('size:')) {
+                    const m = /^(>=|<=|>|<|=)?\s*(.+)$/.exec(tok.slice(5));
+                    const bytes = m ? parseSize(m[2]) : 0;
+                    if (!m || !bytes) { parsed.notes.push('体积条件无法识别'); return; }
+                    parsed.sizes.push({ op: m[1] || '>=', bytes, negate });
+                    return;
+                }
+                if (tok.length > 2 && tok[0] === '/') {
+                    const m = /^\/(.+)\/([a-z]*)$/i.exec(tok);
+                    if (m) {
+                        try {
+                            const flags = m[2].replace(/g/g, '');
+                            parsed.regexes.push(new RegExp(m[1], flags.includes('i') ? flags : flags + 'i'));
+                            return;
+                        } catch (e) { parsed.notes.push('正则表达式无效，已按关键词处理'); }
+                    } else {
+                        // 看起来想写正则但不完整：必须提示，否则用户只会觉得「搜不到」
+                        parsed.notes.push('正则格式不完整（缺少结尾 /），已按关键词处理');
+                    }
+                }
+                const word = unquote(tok);
+                if (!word) return;
+                if (negate) parsed.excludes.push(word.toLowerCase());
+                else { parsed.keywords.push(word.toLowerCase()); parsed.words.push(word); }
+            });
+
+            return parsed;
+        },
+
+        /** 是否含有任何有效条件 */
+        isActive(parsed) {
+            return !!parsed && (parsed.keywords.length > 0 || parsed.excludes.length > 0 || parsed.exts.length > 0
+                || parsed.types.length > 0 || parsed.sizes.length > 0 || parsed.regexes.length > 0);
+        },
+
+        /** 单条是否命中所解析的条件 */
+        match(item, parsed) {
+            if (!item) return false;
+            const name = String(item.name || '').toLowerCase();
+            if (parsed.keywords.some((k) => !name.includes(k))) return false;
+            if (parsed.excludes.some((k) => name.includes(k))) return false;
+            if (parsed.exts.length) {
+                const ext = String(item.ext || '').toLowerCase();
+                if (!ext || !parsed.exts.includes(ext)) return false;
+            }
+            if (parsed.types.length && !parsed.types.includes(item.category)) return false;
+            if (parsed.sizes.length) {
+                const okSize = parsed.sizes.every((s) => {
+                    const hit = (this.OPS[s.op] || this.OPS['>='])(Number(item.size || 0), s.bytes);
+                    return s.negate ? !hit : hit;
+                });
+                if (!okSize) return false;
+            }
+            if (parsed.regexes.length
+                && !parsed.regexes.every((re) => { re.lastIndex = 0; return re.test(String(item.name || '')); })) return false;
+            return true;
+        },
+
+        /** 批量过滤；无有效条件时原样返回（active=false） */
+        filter(items, q) {
+            const list = Array.from(items || []);
+            const parsed = this.parse(q);
+            if (!this.isActive(parsed)) return { items: list, parsed, active: false };
+            return { items: list.filter((it) => this.match(it, parsed)), parsed, active: true };
+        },
+
+        /** 命中片段高亮：先分段再分别转义，避免把用户输入当 HTML 插入 */
+        highlight(name, parsed) {
+            const text = String(name || '');
+            const terms = (parsed && parsed.keywords) || [];
+            if (!terms.length) return util.escapeHtml(text);
+
+            const lower = text.toLowerCase();
+            const ranges = [];
+            terms.forEach((kw) => {
+                if (!kw) return;
+                let from = 0;
+                while (from <= lower.length) {
+                    const at = lower.indexOf(kw, from);
+                    if (at < 0) break;
+                    ranges.push([at, at + kw.length]);
+                    from = at + kw.length;
+                }
+            });
+            if (!ranges.length) return util.escapeHtml(text);
+
+            ranges.sort((a, b) => a[0] - b[0]);
+            const merged = [];
+            ranges.forEach((r) => {
+                const last = merged[merged.length - 1];
+                if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+                else merged.push([r[0], r[1]]);
+            });
+
+            let out = '';
+            let at = 0;
+            merged.forEach(([s, e]) => {
+                out += util.escapeHtml(text.slice(at, s))
+                    + '<mark class="qem-hl">' + util.escapeHtml(text.slice(s, e)) + '</mark>';
+                at = e;
+            });
+            return out + util.escapeHtml(text.slice(at));
+        },
+
+        /** 条件摘要（界面提示用） */
+        describe(parsed) {
+            if (!parsed) return '';
+            const bits = [];
+            if (parsed.keywords.length) bits.push(`关键词 ${(parsed.words.length ? parsed.words : parsed.keywords).join(' + ')}`);
+            if (parsed.excludes.length) bits.push(`排除 ${parsed.excludes.join(' / ')}`);
+            if (parsed.exts.length) bits.push(`扩展名 ${parsed.exts.join('/')}`);
+            if (parsed.types.length) bits.push(`类型 ${parsed.types.join('/')}`);
+            if (parsed.sizes.length) bits.push(parsed.sizes.map((s) => `体积${s.negate ? '非' : ''} ${s.op}${util.humanSize(s.bytes)}`).join(' '));
+            if (parsed.regexes.length) bits.push(`${parsed.regexes.length} 个正则`);
+            if (parsed.notes.length) bits.push(`⚠ ${parsed.notes.join('；')}`);
+            return bits.join('　·　');
+        },
+
+        /** fid → 条目 的索引快照（一次全扫，供 pathLabel 逐行调用；TTL 20 秒） */
+        _idx: { at: 0, map: new Map() },
+
+        invalidateIndex() { this._idx.at = 0; },
+
+        _index() {
+            if (this._idx.at && Date.now() - this._idx.at < 20000) return this._idx.map;
+            const byFid = new Map();
+            try {
+                const prefix = LS_CACHE_PREFIX + 'idx_';
+                const keys = Object.keys(localStorage).filter((k) => k.startsWith(prefix));
+                keys.forEach((k) => {
+                    const raw = localStorage.getItem(k);
+                    if (!raw) return;
+                    const d = JSON.parse(raw);
+                    (d && d.items ? d.items : []).forEach((it) => {
+                        if (it && it.fid) byFid.set(String(it.fid), it);
+                    });
+                });
+            } catch (e) { /* 索引不可读则退化为直达 */ }
+            this._idx = { at: Date.now(), map: byFid };
+            return byFid;
+        },
+
+        /**
+         * 用本地索引缓存反查某一目录的完整路径。
+         * 索引不全时返回不完整结果（只到能解析的最深层），调用方需提示用户。
+         */
+        resolvePath(pdirFid) {
+            const rootPath = [{ fid: ROOT_FID, name: '我的网盘' }];
+            const target = String(pdirFid || ROOT_FID);
+            if (target === ROOT_FID) return { path: rootPath, complete: true };
+
+            const byFid = this._index();
+
+            const chain = [];
+            const seen = new Set();
+            let cur = target;
+            while (cur && cur !== ROOT_FID && !seen.has(cur)) {
+                seen.add(cur);
+                const node = byFid.get(cur);
+                if (!node) return { path: rootPath.concat([{ fid: target, name: '（未解析位置）' }]), complete: false };
+                chain.unshift({ fid: cur, name: node.name });
+                cur = String(node.pdir_fid || ROOT_FID);
+            }
+            return { path: rootPath.concat(chain), complete: true };
+        },
+
+        /** 路径文案（表格列用） */
+        pathLabel(pdirFid) {
+            if (String(pdirFid || ROOT_FID) === ROOT_FID) return '我的网盘';
+            const r = this.resolvePath(pdirFid);
+            return r.complete ? r.path.map((s) => s.name).join(' / ') : '（未解析，可点「定位」）';
+        },
+
+        /** 从搜索结果跳到其所在目录并选中该项 */
+        async locate(item) {
+            const res = this.resolvePath(item.pdir_fid);
+            if (!res.complete) ui.toast('本地索引未覆盖该路径，已直接跳到所在目录（面包屑可能不完整）', 'warn', 4500);
+            state.path = res.path;
+            state.cursor = -1;
+            state.anchor = null;
+            if (workspace.setQuery) workspace.setQuery('');
+            state.query = '';
+            await workspace.reload(item.pdir_fid);
+            sel.set([item.fid]);
+            if (workspace.render) workspace.render();
+        },
+
+        /** 全盘搜索面板：结果可定位、下载、移动、删除（删除走回收站且可撤销） */
+        async openGlobal(initial = '') {
+            const p = ui.panel({
+                title: '全盘搜索', size: 'lg',
+                buttons: [{ label: t('close'), onClick: (a) => a.close() }],
+            });
+
+            const bar = document.createElement('div');
+            bar.className = 'qem-search';
+            const box = document.createElement('div');
+            box.className = 'box';
+            const ico = document.createElement('span');
+            ico.className = 'ico';
+            ico.textContent = '🔎';
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.placeholder = '按文件名全盘搜索（支持 ext: / type: / size: 与 -排除）';
+            input.value = initial;
+            box.append(ico, input);
+            const goBtn = document.createElement('button');
+            goBtn.className = 'primary';
+            goBtn.textContent = '搜索';
+            bar.append(box, goBtn);
+
+            const stat = document.createElement('div');
+            stat.className = 'muted';
+            const listBox = document.createElement('div');
+            listBox.className = 'qem-content';
+            listBox.style.marginTop = '10px';
+            const acts = document.createElement('div');
+            acts.className = 'row';
+            acts.style.marginTop = '10px';
+            acts.style.flexWrap = 'wrap';
+            p.body.append(bar, stat, listBox, acts);
+
+            let rows = [];
+            let picked = [];
+            let running = false;
+            const target = () => (picked.length ? picked : rows);
+
+            const run = async () => {
+                const q = input.value.trim();
+                if (!q) return ui.toast('请输入搜索关键词', 'warn');
+                // 服务端只认文件名关键词；ext:/type:/size:/排除 属本地筛选语法，原样送出必然搜不到
+                const kw = finder.parse(q).words.join(' ');
+                if (!kw) {
+                    return ui.toast('全盘搜索需要至少一个文件名关键词（ext: / type: / size: 仅用于本地筛选）', 'warn', 5000);
+                }
+                if (running) return;
+                running = true;
+                goBtn.disabled = true;
+                stat.textContent = t('working');
+                listBox.innerHTML = '';
+                rows = [];
+                picked = [];
+                acts.innerHTML = '';
+                try {
+                    const r = await api.searchAll(kw, { max: 300, onProgress: (n, tt) => { stat.textContent = `已获取 ${n} / ${tt}`; } });
+                    rows = r.items;
+                    let desc = finder.describe(finder.parse(q));
+                    if (kw !== q) desc = '';   // 服务端按关键词搜，结构化条件不再成立
+                    stat.textContent = `找到 ${rows.length} 项`
+                        + (r.total > rows.length ? `（共 ${r.total}，已截断）` : '')
+                        + (desc ? '　·　' + desc : '');
+                } catch (e) {
+                    stat.textContent = '';
+                    const err = document.createElement('div');
+                    err.className = 'qem-empty';
+                    err.textContent = `搜索失败：${e.message}`;
+                    listBox.appendChild(err);
+                    return;
+                } finally {
+                    running = false;
+                    goBtn.disabled = false;
+                }
+
+                if (!rows.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'qem-empty';
+                    empty.textContent = '没有找到匹配的文件';
+                    listBox.appendChild(empty);
+                    return;
+                }
+
+                const tb = ui.table([
+                    { key: 'name', label: '名称', render: (v, row) => {
+                        const b = document.createElement('div');
+                        b.className = 'name';
+                        const ic = document.createElement('span');
+                        ic.textContent = (CATEGORY[row.category] || CATEGORY.other).icon;
+                        const tx = document.createElement('span');
+                        tx.className = 'txt';
+                        tx.title = v;
+                        tx.innerHTML = finder.highlight(v, finder.parse(kw));
+                        b.append(ic, tx);
+                        return b;
+                    } },
+                    { key: 'pdir_fid', label: '所在目录', render: (v) => util.escapeHtml(finder.pathLabel(v)) },
+                    { key: 'size', label: '大小', align: 'right', render: (v, row) => row.dir ? '-' : util.humanSize(v) },
+                    { key: 'updated_at', label: '修改时间', render: (v) => util.escapeHtml(util.ts(v)) },
+                    { key: 'act', label: '操作', render: (v, row) => {
+                        const b = document.createElement('button');
+                        b.textContent = '定位';
+                        b.title = '打开其所在目录并选中';
+                        b.addEventListener('click', async () => {
+                            p.close();
+                            await finder.locate(row);
+                        });
+                        return b;
+                    } },
+                ], rows, { selectable: true, maxHeight: '46vh', onSelectionChange: (rs) => { picked = rs; } });
+                listBox.appendChild(tb.el);
+
+                const mkAct = (label, cls, fn) => {
+                    const b = document.createElement('button');
+                    b.textContent = label;
+                    if (cls) b.className = cls;
+                    b.addEventListener('click', fn);
+                    acts.appendChild(b);
+                    return b;
+                };
+                mkAct('下载选中', '', () => {
+                    const list = target().filter((x) => !x.dir);
+                    if (!list.length) return ui.toast('没有可下载的文件（文件夹需先定位后处理）', 'warn');
+                    downloader.downloadSelection(list);
+                });
+                mkAct('移动到...', '', async () => {
+                    const list = target();
+                    if (!list.length) return ui.toast(t('noSelection'), 'warn');
+                    const to = await picker.chooseFolder('移动到哪个文件夹');
+                    if (to === null) return;
+                    try {
+                        const plan = await conflict.resolve(to, list, { label: '移动（搜索结果）' });
+                        if (plan.action === 'abort') return;
+                        if (plan.needRename.length) {
+                            await api.renameMany(plan.needRename.map((r) => ({ fid: r.fid, file_name: r.file_name })));
+                        }
+                        const fids = plan.toMove.map((x) => x.fid);
+                        if (!fids.length) return ui.toast('全部项目因同名被跳过', 'warn');
+                        await api.move(fids, to);
+                        opLog.push({
+                            type: 'move',
+                            label: '搜索结果移动',
+                            entries: plan.toMove.map((x) => ({ fid: x.fid, name: (x.item || {}).name || '', pdir: (x.item || {}).pdir_fid, toPdir: to })),
+                            note: plan.skipped.length ? `跳过 ${plan.skipped.length} 个同名项` : '',
+                        });
+                        ui.toast(`已移动 ${fids.length} 项`);
+                        p.close();
+                    } catch (e) { ui.toast('移动失败：' + e.message, 'error'); }
+                });
+                mkAct('删除（可撤销）', 'danger', async () => {
+                    const list = target();
+                    if (!list.length) return ui.toast(t('noSelection'), 'warn');
+                    const ok = await ui.confirm(`将把 ${list.length} 个项目移入回收站，可稍后撤销。是否继续？`, { danger: true, okText: '移入回收站' });
+                    if (!ok) return;
+                    const pr = ui.progress('删除中');
+                    try {
+                        const n = await deleteWithUndo(list, { label: '搜索结果删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`) });
+                        pr.close();
+                        ui.toast(`已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
+                        p.close();
+                    } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
+                });
+                mkAct('复制名称清单', '', () => {
+                    const list = target();
+                    util.copy(list.map((x) => x.name).join('\n'), `已复制 ${list.length} 条`);
+                });
+            };
+
+            goBtn.addEventListener('click', run);
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); run(); }
+            });
+            if (initial) run();
+            else setTimeout(() => input.focus(), 30);
+        },
+    };
+
+    /* ======================================================================
      * 7. 运行态（当前目录 / 选中项 / 剪贴板）
      * ==================================================================== */
 
@@ -3295,6 +3785,9 @@ ${warn}
         stale: null,          // { at, reason } —— 目录列表降级为缓存时置位
         ui: null,             // 工作台面板引用
         table: null,
+        query: '',            // 当前目录筛选串
+        cursor: -1,           // 键盘游标行（可见列表索引）
+        anchor: null,         // Shift 连选的锚点
     };
 
     const sel = {
@@ -3322,6 +3815,9 @@ ${warn}
     const workspace = {
         /** 由 render 阶段覆盖：刷新底部选中状态栏 */
         syncFoot: () => { },
+        /** 由 open 阶段覆盖：写入 / 聚焦筛选框 */
+        setQuery: null,
+        focusSearch: null,
 
         async open() {
             if (state.ui && state.ui.el && state.ui.el.isConnected) return;
@@ -3335,16 +3831,90 @@ ${warn}
                 onClose: () => { state.ui = null; state.table = null; },
             });
             state.ui = p;
+            // 每次打开都从干净状态开始，避免上次的筛选让人误以为文件没了
+            state.query = '';
+            state.cursor = -1;
+            state.anchor = null;
 
-            // 面包屑 + 工具条
+            // 面包屑 + 搜索条 + 工具栏（三段式，区域边界清晰）
             const bar = document.createElement('div');
             bar.className = 'col';
             bar.style.marginBottom = '10px';
             const crumb = document.createElement('div');
             crumb.className = 'qem-crumb';
+
+            // 搜索条：输入即筛（纯本地，不发请求）；回车走全盘搜索
+            const searchBar = document.createElement('div');
+            searchBar.className = 'qem-search';
+            const sBox = document.createElement('div');
+            sBox.className = 'box';
+            const sIco = document.createElement('span');
+            sIco.className = 'ico';
+            sIco.textContent = '🔎';
+            const sInput = document.createElement('input');
+            sInput.type = 'text';
+            sInput.placeholder = '筛选当前目录：空格=且　-排除　"词组"　ext:mkv　type:视频　size:>1gb　/正则/';
+            sInput.value = state.query || '';
+            sInput.title = 'Ctrl+F 聚焦本框；回车改为全盘搜索';
+            const sClr = document.createElement('button');
+            sClr.className = 'clr' + (state.query ? ' on' : '');
+            sClr.textContent = '✕';
+            sClr.title = '清除筛选（Esc）';
+            sBox.append(sIco, sInput, sClr);
+            const sStat = document.createElement('span');
+            sStat.className = 'stat';
+            const sHint = document.createElement('span');
+            sHint.className = 'hint';
+            sHint.textContent = '回车 = 全盘搜索';
+            const sGlobal = document.createElement('button');
+            sGlobal.textContent = '全盘搜索';
+            sGlobal.title = '跨目录按文件名搜索（不限于当前目录）';
+            searchBar.append(sBox, sStat, sHint, sGlobal);
+
+            let sTimer = 0;
+            workspace.setQuery = (v) => {
+                sInput.value = v;
+                state.query = v;
+                sClr.classList.toggle('on', !!v);
+            };
+            workspace.focusSearch = () => { sInput.focus(); sInput.select(); };
+            const applyQuery = (v) => {
+                state.query = v;
+                sClr.classList.toggle('on', !!v);
+                state.cursor = -1;
+                state.anchor = null;
+                if (sTimer) clearTimeout(sTimer);
+                sTimer = setTimeout(() => {
+                    sTimer = 0;
+                    if (state.ui && state.ui.el && state.ui.el.isConnected) workspace.render();
+                }, 120);   // 输入去抖
+            };
+            sInput.addEventListener('input', () => applyQuery(sInput.value));
+            sInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const q = sInput.value.trim();
+                    if (q) finder.openGlobal(q);
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    sInput.value = '';
+                    applyQuery('');
+                    sInput.blur();
+                }
+            });
+            sClr.addEventListener('click', () => { sInput.value = ''; applyQuery(''); sInput.focus(); });
+            sGlobal.addEventListener('click', () => {
+                const q = (sInput.value || '').trim();
+                if (!q) { sInput.focus(); return ui.toast('先在筛选框输入关键词', 'warn'); }
+                // 结构化条件（ext: / type: / size: / -排除）只对本地筛选有效，传服务端只带关键词
+                const kw = finder.parse(q).words.join(' ');
+                if (!kw) return ui.toast('全盘搜索至少需要一个文件名关键词', 'warn', 4500);
+                finder.openGlobal(kw);
+            });
+
             const tools = document.createElement('div');
             tools.className = 'qem-toolbar';
-            bar.append(crumb, tools);
+            bar.append(crumb, searchBar, tools);
             p.body.appendChild(bar);
 
             const listBox = document.createElement('div');
@@ -3436,15 +4006,47 @@ ${warn}
 
                 // 列表
                 listBox.innerHTML = '';
+                searchBar.classList.toggle('on', !!state.query);
                 if (state.loading) {
+                    sStat.textContent = '';
+                    sHint.textContent = '回车 = 全盘搜索';
                     listBox.innerHTML = '<div class="qem-empty">' + t('loading') + '</div>';
                     return;
                 }
                 if (!state.items.length) {
+                    sStat.textContent = '';
+                    sHint.textContent = '回车 = 全盘搜索';
                     listBox.innerHTML = '<div class="qem-empty">' + t('empty') + '</div>';
                     return;
                 }
-                const shown = workspace.sortedItems();
+                // 排序 → 筛选；筛选期间的选中集只允许包含可见项
+                const filtered = finder.filter(workspace.sortedItems(), state.query);
+                const shown = filtered.items;
+                if (filtered.active && state.selection.size) {
+                    const visibleFids = new Set(shown.map((i) => i.fid));
+                    Array.from(state.selection).forEach((fid) => { if (!visibleFids.has(fid)) state.selection.delete(fid); });
+                }
+                if (filtered.active) {
+                    sStat.textContent = `筛选 ${shown.length} / ${state.items.length}`;
+                    sHint.textContent = finder.describe(filtered.parsed) || '回车 = 全盘搜索';
+                    if (!shown.length) {
+                        const eb = document.createElement('div');
+                        eb.className = 'qem-empty';
+                        const line = document.createElement('div');
+                        line.textContent = `没有匹配「${state.query}」的项目`;
+                        const clrBtn = document.createElement('button');
+                        clrBtn.textContent = '清除筛选';
+                        clrBtn.style.marginTop = '10px';
+                        clrBtn.addEventListener('click', () => { sInput.value = ''; applyQuery(''); });
+                        eb.append(line, clrBtn);
+                        listBox.appendChild(eb);
+                        workspace.syncFoot();
+                        return;
+                    }
+                } else {
+                    sStat.textContent = '';
+                    sHint.textContent = '回车 = 全盘搜索';
+                }
                 const sPref = config.get('sortPref', {})[state.cwd] || { key: 'updated_at', order: 'desc' };
                 // 图标元素（缩略图加载失败时回退到它）
                 const iconOf = (row) => {
@@ -3469,8 +4071,10 @@ ${warn}
                         }
                         const tx = document.createElement('span');
                         tx.className = 'txt';
-                        tx.textContent = v;
                         tx.title = v;
+                        // 有筛选时高亮命中片段（highlight 内部逐段转义，可安全用作 HTML）
+                        if (filtered.active) tx.innerHTML = finder.highlight(v, filtered.parsed);
+                        else tx.textContent = v;
                         box.appendChild(tx);
                         return box;
                     } },
@@ -3517,7 +4121,10 @@ ${warn}
                         else downloader.downloadSelection([item]);
                     });
                 });
+                // 键盘游标行（↑↓ 导航时可见）
+                if (state.cursor >= 0 && state.cursor < trs.length) trs[state.cursor].classList.add('cur');
                 workspace.syncFoot();
+
             };
 
             const foot = () => {
@@ -3541,10 +4148,66 @@ ${warn}
             return fileModel.sort(state.items, pref.key, pref.order);
         },
 
+        /** 当前筛选 + 排序后的可见项（批量操作与快捷键都以此为准） */
+        visible() {
+            return finder.filter(workspace.sortedItems(), state.query).items;
+        },
+
+        /** 键盘导航：移动游标；extend 时按锚点区间选中 */
+        moveCursor(delta, { extend = false, absolute = null } = {}) {
+            const shown = workspace.visible();
+            if (!shown.length) return;
+            const max = shown.length - 1;
+            let next;
+            if (absolute === 'home') next = 0;
+            else if (absolute === 'end') next = max;
+            else if (typeof absolute === 'number') next = absolute;
+            else next = state.cursor < 0 ? (delta > 0 ? 0 : max) : state.cursor + delta;
+            next = Math.max(0, Math.min(max, next));
+
+            if (extend) {
+                if (state.anchor === null || state.anchor === undefined) state.anchor = state.cursor < 0 ? next : state.cursor;
+                const lo = Math.min(state.anchor, next);
+                const hi = Math.max(state.anchor, next);
+                state.selection = new Set(shown.slice(lo, hi + 1).map((i) => i.fid));
+            } else {
+                state.anchor = next;
+                state.selection = new Set([shown[next].fid]);
+            }
+            state.cursor = next;
+            workspace.render();
+
+            const trs = state.table ? state.table.el.querySelectorAll('tbody tr') : [];
+            const tr = trs[next];
+            if (tr && typeof tr.scrollIntoView === 'function') {
+                try { tr.scrollIntoView({ block: 'nearest' }); } catch (e) { /* jsdom 无布局，忽略 */ }
+            }
+        },
+
+        /** 回车：目录进入 / 文件按配置预览或下载 */
+        openItem(index = state.cursor) {
+            const item = workspace.visible()[index];
+            if (!item) return;
+            if (item.dir) return workspace.enter(item);
+            if (config.get('clickAction', 'preview') === 'preview') return preview.open(item);
+            return downloader.downloadSelection([item]);
+        },
+
+        /** 清空筛选（Esc / 空态按钮 / 跳转定位时调用） */
+        clearQuery() {
+            if (workspace.setQuery) workspace.setQuery('');
+            state.query = '';
+            state.cursor = -1;
+            state.anchor = null;
+            if (workspace.render) workspace.render();
+        },
+
         async reload(pdir = null) {
             if (pdir !== null) state.cwd = pdir;
             state.loading = true;
             state.stale = null;
+            state.cursor = -1;
+            state.anchor = null;
             sel.clear();
             if (workspace.render) workspace.render();
             try {
@@ -3554,6 +4217,7 @@ ${warn}
                 state.items = r.items;
                 // 成功后刷新本地索引，作为后续请求失败时的降级数据
                 indexCache.write(state.cwd, r.items);
+                finder.invalidateIndex();
             } catch (e) {
                 // 缓存列表保护：接口异常时不让列表变空，避免用户误判为文件丢失
                 const cached = indexCache.read(state.cwd);
@@ -5948,6 +6612,21 @@ ${warn}
                 const panelOpen = !!(state.ui && state.ui.el && state.ui.el.isConnected);
                 if (!panelOpen) return;
 
+                // Ctrl+F：聚焦筛选框（固定行为，不占用自定义快捷键位）
+                if (combo === 'Ctrl+F') { e.preventDefault(); if (workspace.focusSearch) workspace.focusSearch(); return; }
+
+                // 方向键导航：↑↓ 移动游标，Shift 连选，Home/End 首尾，Enter 打开
+                if (!e.ctrlKey && !e.altKey) {
+                    const nav = {
+                        ArrowDown: () => workspace.moveCursor(1, { extend: e.shiftKey }),
+                        ArrowUp: () => workspace.moveCursor(-1, { extend: e.shiftKey }),
+                        Home: () => workspace.moveCursor(0, { absolute: 'home', extend: e.shiftKey }),
+                        End: () => workspace.moveCursor(0, { absolute: 'end', extend: e.shiftKey }),
+                        Enter: () => workspace.openItem(),
+                    };
+                    if (nav[e.key]) { e.preventDefault(); nav[e.key](); return; }
+                }
+
                 const actions = {
                     [sc.refresh]: () => workspace.reload(),
                     [sc.rename]: () => renameTool.open(),
@@ -5956,9 +6635,19 @@ ${warn}
                     [sc.download]: () => downloader.downloadSelection(),
                     [sc.dedup]: () => dedup.openFiles(),
                     [sc.insight]: () => insight.open(),
-                    [sc.selectAll]: () => { sel.all(); workspace.render(); },
-                    [sc.invert]: () => { sel.invert(); workspace.render(); },
-                    [sc.escape]: () => { sel.clear(); workspace.render(); },
+                    [sc.selectAll]: () => { state.selection = new Set(workspace.visible().map((i) => i.fid)); workspace.render(); },
+                    [sc.invert]: () => {
+                        const next = new Set();
+                        workspace.visible().forEach((i) => { if (!state.selection.has(i.fid)) next.add(i.fid); });
+                        state.selection = next;
+                        workspace.render();
+                    },
+                    [sc.escape]: () => {
+                        // 有筛选先清筛选（否则用户看不清为什么全选只选到几项）
+                        if (state.query) { workspace.clearQuery(); return; }
+                        sel.clear();
+                        workspace.render();
+                    },
                     [sc.copy]: () => { state.clipboard = { mode: 'copy', items: sel.items() }; ui.toast(`已复制 ${sel.count()} 项到剪贴板`); },
                     [sc.cut]: () => { state.clipboard = { mode: 'cut', items: sel.items() }; ui.toast(`已剪切 ${sel.count()} 项`); },
                     [sc.paste]: async () => {
@@ -6067,6 +6756,7 @@ ${warn}
             GM_registerMenuCommand('目录树导出', () => exporter.tree());
             GM_registerMenuCommand('解析分享链接', () => shareTool.parse());
             GM_registerMenuCommand('我的分享', () => shareTool.myList());
+            GM_registerMenuCommand('全盘搜索', () => finder.openGlobal());
             GM_registerMenuCommand('空间占用分析', () => spaceReport.open());
             GM_registerMenuCommand('跨账号校验：导出账号清单', () => crossCheck.exportFlow());
             GM_registerMenuCommand('跨账号校验：导入并比对', () => crossCheck.compareFlow());
@@ -6115,7 +6805,7 @@ ${warn}
                 config, api, guard, breaker, EP, util, fileModel, scanner, indexCache, ui,
                 renameRules, parseSize, nameSimilarity,
                 opLog, conflict, capacityGuard, snapshot, cfgHistory, spaceReport, deleteWithUndo, crossCheck, viewPref,
-                workspace, dedup, cleanup, exporter, shareTool, trash, settings,
+                workspace, finder, dedup, cleanup, exporter, shareTool, trash, settings,
                 downloader, player, imgSearch, insight, preview, property, picker, state, sel,
                 fab, shortcutMgr,
             };

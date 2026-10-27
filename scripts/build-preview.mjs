@@ -26,7 +26,7 @@ const THUMB = (a, b) => `data:image/svg+xml,${encodeURIComponent(
 
 const FILES = [
     { icon: '📁', name: '影视素材', size: '12 项', tag: '文件夹', thumb: '' },
-    { icon: '🎬', name: '电影A.2024.1080p.mkv', size: '2.00 GB', tag: '视频 · mkv', thumb: THUMB('#0f83e6', '#0067c0'), sel: true },
+    { icon: '🎬', name: '电影A.2024.1080p.mkv', hl: '电影A.<mark class="qem-hl">2024</mark>.1080p.mkv', size: '2.00 GB', tag: '视频 · mkv', thumb: THUMB('#0f83e6', '#0067c0'), sel: true, cur: true },
     { icon: '🎬', name: '合集教程第01集.mp4', size: '100.00 MB', tag: '视频 · mp4', thumb: THUMB('#2fbf8f', '#16a06b') },
     { icon: '🖼️', name: '设计稿-封面.png', size: '1.24 MB', tag: '图片 · png', thumb: THUMB('#e6a23c', '#d97706') },
     { icon: '📄', name: '项目文档.pdf', size: '840.00 KB', tag: '文档 · pdf', thumb: '' },
@@ -50,11 +50,11 @@ const toolbarHtml = TOOLBAR_GROUPS
     .join('<span class="qem-sep"></span>');
 
 const rowsHtml = FILES.map((f) => `
-        <tr${f.sel ? ' class="sel"' : ''}>
+        <tr class="${[f.sel ? 'sel' : '', f.cur ? 'cur' : ''].filter(Boolean).join(' ')}">
           <td><input type="checkbox"${f.sel ? ' checked' : ''}></td>
           <td><div class="name">${f.thumb
         ? `<img class="qem-thumb" src="${f.thumb}" alt="">`
-        : `<span>${f.icon}</span>`}<span class="txt">${f.name}</span></div></td>
+        : `<span>${f.icon}</span>`}<span class="txt">${f.hl || f.name}</span></div></td>
           <td class="num">${f.size}</td>
           <td><span class="qem-tag">${f.tag}</span></td>
           <td>2026-10-11 15:20</td>
@@ -121,7 +121,7 @@ ${css}
 <div class="pv-wrap">
 
   <div class="pv-sec">
-    <h2>工作台面板（含页眉 / 面包屑 / 分组工具栏 / 内容区 / 状态栏）</h2>
+    <h2>工作台面板（页眉 / 面包屑 / 筛选条 / 分组工具栏 / 内容区 / 状态栏）</h2>
     <div class="qem-scope" id="pv-scope">
       <div class="qem-panel qem-lg" style="width:100%;height:auto;max-width:1200px">
         <div class="qem-head">
@@ -135,6 +135,16 @@ ${css}
               <button>我的网盘</button><span class="sep">›</span>
               <button>影视素材</button><span class="sep">›</span>
               <button>2024 合集</button>
+            </div>
+            <div class="qem-search on">
+              <div class="box">
+                <span class="ico">🔎</span>
+                <input type="text" value="2024" placeholder="筛选当前目录">
+                <button class="clr on">✕</button>
+              </div>
+              <span class="stat">筛选 1 / 7</span>
+              <span class="hint">关键词 2024</span>
+              <button>全盘搜索</button>
             </div>
             <div class="qem-toolbar">${toolbarHtml}</div>
           </div>

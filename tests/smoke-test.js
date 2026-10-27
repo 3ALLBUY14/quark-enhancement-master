@@ -89,6 +89,12 @@ function stubFetch(url, init) {
         const list = FILES[fid] || [];
         return ok({ list }, { _total: list.length, _count: list.length, _page: 1 });
     }
+    if (u.includes('/file/search')) {
+        const m = /[?&]q=([^&]*)/.exec(u);
+        const q = m ? decodeURIComponent(m[1]).toLowerCase() : '';
+        const list = Object.values(FILES).flat().filter((f) => f.file_name.toLowerCase().includes(q));
+        return ok({ list }, { _total: list.length, _count: list.length, _page: 1 });
+    }
     if (u.includes('/file/rename')) return ok({});
     if (u.includes('/file/delete')) {
         const body = JSON.parse((init && init.body) || '{}');
@@ -1047,6 +1053,264 @@ check('规则：非法字符被清理', () => !/[\\/:*?"<>|]/.test(Q.renameRules
         check('回收站未超限时不标记截断', () => expect(Q.trash._truncated === false, `_truncated=${Q.trash._truncated}`));
         Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
         recycleFixture = null;
+    }
+
+    /* ---------------- 搜索与筛选（v0.1.7） ---------------- */
+
+    {
+        const p1 = Q.finder.parse('电影 mkv');
+        check('筛选解析：空格分词为 AND', () => expect(
+            p1.keywords.length === 2 && p1.keywords.join(',') === '电影,mkv', `keywords=${p1.keywords}`));
+
+        const p2 = Q.finder.parse('-教程 合集');
+        check('筛选解析：-前缀为排除', () => expect(
+            p2.excludes[0] === '教程' && p2.keywords[0] === '合集', `keywords=${p2.keywords} excludes=${p2.excludes}`));
+
+        const p3 = Q.finder.parse('ext:mkv,MP4 type:视频 size:>1gb');
+        check('筛选解析：ext / type / size 条件', () => expect(
+            p3.exts.join(',') === 'mkv,mp4' && p3.types[0] === 'video'
+            && p3.sizes[0].op === '>' && p3.sizes[0].bytes === 1024 ** 3,
+            JSON.stringify({ ext: p3.exts, type: p3.types, size: p3.sizes })));
+
+        const p4 = Q.finder.parse('"合集 教程"');
+        check('筛选解析：引号内空格不分词', () => expect(
+            p4.keywords.length === 1 && p4.keywords[0] === '合集 教程', `keywords=${p4.keywords}`));
+
+        const p5 = Q.finder.parse('/^S\\d+E\\d+/');
+        check('筛选解析：正则条件（默认忽略大小写）', () => expect(
+            p5.regexes.length === 1 && p5.regexes[0].test('S01E01.mkv') && p5.regexes[0].test('s02e03.avi'),
+            `notes=${p5.notes}`));
+
+        const p6 = Q.finder.parse('/([');
+        check('筛选解析：非法正则降级为关键词且不抛错', () => expect(
+            p6.regexes.length === 0 && p6.keywords.length === 1 && p6.notes.length === 1, JSON.stringify(p6)));
+
+        const p7 = Q.finder.parse('size:abc');
+        check('筛选解析：非法体积条件记入 notes', () => expect(
+            p7.sizes.length === 0 && p7.notes.length === 1, JSON.stringify(p7)));
+
+        const p8 = Q.finder.parse('S01E01');
+        check('筛选解析：匹配用小写副本，原词保留大小写（服务端搜索需原样）', () => expect(
+            p8.keywords[0] === 's01e01' && p8.words[0] === 'S01E01',
+            `keywords=${p8.keywords} words=${p8.words}`));
+
+        const p9 = Q.finder.parse('*.MKV');
+        check('筛选解析：glob 写法 *.MKV 等同 ext:mkv', () => expect(
+            p9.exts.length === 1 && p9.exts[0] === 'mkv' && p9.keywords.length === 0,
+            JSON.stringify({ ext: p9.exts, kw: p9.keywords })));
+    }
+
+    {
+        const items = Q.state.items;   // 当前目录 8 项
+        const r1 = Q.finder.filter(items, '合集');
+        check('筛选：关键词命中 3 项（含磁力合集.txt）', () => expect(
+            r1.active && r1.items.length === 3, `命中=${r1.items.map((i) => i.name)}`));
+
+        const r2 = Q.finder.filter(items, 'mp4');
+        check('筛选：按关键词命中 mp4 两项', () => expect(r2.items.length === 2, `命中=${r2.items.length}`));
+
+        const r3 = Q.finder.filter(items, 'type:folder');
+        check('筛选：type:folder 只命中文件夹', () => expect(
+            r3.items.length === 2 && r3.items.every((i) => i.dir), `命中=${r3.items.length}`));
+
+        const r4 = Q.finder.filter(items, 'ext:mkv size:>1gb');
+        check('筛选：ext 与 size 组合为 AND', () => expect(
+            r4.items.length > 0 && r4.items.every((i) => i.ext === 'mkv' && i.size > 1024 ** 3),
+            `命中=${r4.items.length}`));
+
+        const r5 = Q.finder.filter(items, '');
+        check('筛选：空串不过滤（active=false）', () => expect(
+            r5.active === false && r5.items.length === items.length));
+
+        const r6 = Q.finder.filter(items, '不存在的名字zzz');
+        check('筛选：无命中返回空数组', () => expect(r6.active === true && r6.items.length === 0));
+    }
+
+    {
+        const html = Q.finder.highlight('电影A.2024.mkv', Q.finder.parse('2024'));
+        check('高亮：命中片段包裹 mark', () => expect(
+            html.includes('<mark class="qem-hl">2024</mark>'), html));
+
+        const evil = Q.finder.highlight('<img src=x onerror=alert(1)>电影', Q.finder.parse('电影'));
+        check('高亮：用户内容已转义（防 XSS）', () => expect(
+            !evil.includes('<img') && evil.includes('&lt;img'), evil));
+
+        const dup = Q.finder.highlight('aaaa', Q.finder.parse('aa aa'));
+        check('高亮：重叠区间合并，不重复包裹', () => expect(
+            (dup.match(/<mark/g) || []).length === 1, dup));
+    }
+
+    {
+        await Q.workspace.open();
+        await tick(80);
+        const sInput = shadow().querySelector('.qem-search input');
+        check('工作台搜索条已渲染', () => expect(!!sInput, '未找到 .qem-search input'));
+        check('筛选框带语法提示', () => expect(
+            !!sInput && /ext:/.test(sInput.placeholder) && /排除/.test(sInput.placeholder), sInput && sInput.placeholder));
+
+        // 输入筛选（去抖 120ms）
+        sInput.value = 'mkv';
+        sInput.dispatchEvent(new window.Event('input'));
+        await tick(220);
+
+        check('筛选后表格只显示命中行', () => expect(
+            Q.state.table.el.querySelectorAll('tbody tr').length === 2,
+            `行数=${Q.state.table.el.querySelectorAll('tbody tr').length}`));
+
+        const stat = shadow().querySelector('.qem-search .stat');
+        check('筛选计数显示「命中 / 总数」', () => expect(
+            !!stat && stat.textContent.includes('2 / 8'), stat && stat.textContent));
+
+        check('名称列渲染命中高亮', () => expect(
+            !!Q.state.table.el.querySelector('mark.qem-hl'), '未找到 mark.qem-hl'));
+
+        // 关键安全点：被筛掉（不可见）的项必须移出选中集，否则批量删除会误伤
+        Q.sel.set(['f_a', 'f_c']);
+        Q.workspace.render();
+        check('筛选时隐藏项自动移出选中集', () => expect(
+            Q.sel.count() === 1 && Q.sel.has('f_a'), `选中=${Q.sel.get()}`));
+
+        // 键盘导航
+        Q.sel.clear();
+        Q.workspace.render();
+        Q.workspace.moveCursor(1);
+        check('↓ 首次按下把游标落在首行并选中', () => expect(
+            Q.state.cursor === 0 && Q.sel.count() === 1, `cursor=${Q.state.cursor} sel=${Q.sel.count()}`));
+        check('游标行带 cur 样式', () => expect(
+            !!Q.state.table.el.querySelector('tbody tr.cur'), '未找到 .cur 行'));
+
+        Q.workspace.moveCursor(1, { extend: true });
+        check('Shift+↓ 按锚点连选两行', () => expect(
+            Q.sel.count() === 2, `sel=${Q.sel.count()}`));
+
+        Q.workspace.moveCursor(99);
+        check('↓ 不越过末行', () => expect(
+            Q.state.cursor === Q.workspace.visible().length - 1, `cursor=${Q.state.cursor}`));
+
+        Q.workspace.moveCursor(0, { absolute: 'home' });
+        check('Home 回到首行', () => expect(Q.state.cursor === 0, `cursor=${Q.state.cursor}`));
+
+        // 全选 / 反选只作用于可见项（筛选期间不应选中隐藏文件）
+        Q.sel.clear();
+        window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));
+        check('筛选期间 Ctrl+A 只选可见项', () => expect(
+            Q.sel.count() === 2, `选中=${Q.sel.count()}（应 2）`));
+
+        // Esc 先清筛选、再清选中
+        window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await tick(60);
+        check('Esc 优先清除筛选', () => expect(
+            Q.state.query === '' && sInput.value === '', `query=${Q.state.query} input=${sInput.value}`));
+
+        // Enter 打开：目录应走 enter()
+        const shown = Q.workspace.visible();
+        const dirIdx = shown.findIndex((i) => i.dir);
+        const origEnter = Q.workspace.enter;
+        let enteredFid = null;
+        Q.workspace.enter = async (it) => { enteredFid = it.fid; };
+        Q.workspace.moveCursor(0, { absolute: dirIdx });
+        Q.workspace.openItem();
+        Q.workspace.enter = origEnter;
+        check('Enter 对目录调用 enter()', () => expect(
+            enteredFid === shown[dirIdx].fid, `entered=${enteredFid} 期望=${shown[dirIdx].fid}`));
+
+        // Ctrl+F 聚焦筛选框
+        window.document.body.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true }));
+        check('Ctrl+F 聚焦筛选框', () => expect(
+            shadow().activeElement === sInput, `active=${shadow().activeElement && shadow().activeElement.tagName}`));
+
+        // 重新打开应清空上次筛选
+        sInput.value = 'mkv';
+        sInput.dispatchEvent(new window.Event('input'));
+        await tick(200);
+        Q.state.ui.close();
+        await tick(30);
+        await Q.workspace.open();
+        await tick(80);
+        const sInput2 = shadow().querySelector('.qem-search input');
+        check('重新打开工作台会清空上次筛选', () => expect(
+            Q.state.query === '' && sInput2 && sInput2.value === ''
+            && Q.state.table.el.querySelectorAll('tbody tr').length === 8,
+            `query=${Q.state.query} 行数=${Q.state.table && Q.state.table.el.querySelectorAll('tbody tr').length}`));
+    }
+
+    {
+        const r = await Q.api.searchAll('S01E01');
+        check('全盘搜索：跨目录命中同名文件', () => expect(
+            r.items.length === 2 && r.items.every((i) => i.name === 'S01E01.mkv'), `命中=${r.items.length}`));
+        check('全盘搜索：按 fid 去重', () => expect(
+            new Set(r.items.map((i) => i.fid)).size === r.items.length));
+
+        const empty = await Q.api.searchAll('   ');
+        check('全盘搜索：空关键词不发请求', () => expect(
+            empty.items.length === 0 && empty.total === 0));
+    }
+
+    {
+        // 路径反查依赖本地索引：先刷新根目录建立缓存
+        await Q.workspace.reload('0');
+        const p = Q.finder.resolvePath('d_1');
+        check('路径反查：索引齐全时完整解析', () => expect(
+            p.complete && p.path.map((s) => s.name).join('/') === '我的网盘/影视', JSON.stringify(p)));
+
+        check('路径文案可直接用于表格列', () => expect(
+            Q.finder.pathLabel('d_1') === '我的网盘 / 影视', Q.finder.pathLabel('d_1')));
+
+        const unknown = Q.finder.resolvePath('d_unknown');
+        check('路径反查：未索引目录标记为不完整', () => expect(
+            unknown.complete === false && unknown.path.length === 2, JSON.stringify(unknown)));
+    }
+
+    {
+        // 全盘搜索面板端到端：结果行 + 定位按钮 + 关闭
+        Q.finder.openGlobal('S01E01');
+        let rowCount = 0;
+        for (let i = 0; i < 30 && rowCount !== 2; i++) {
+            await tick(60);
+            const m = lastMask();
+            rowCount = m ? m.querySelectorAll('.qem-table tbody tr').length : 0;
+        }
+        const mask = lastMask();
+        check('全盘搜索面板：渲染结果行', () => expect(rowCount === 2, `行数=${rowCount}（应 2）`));
+        check('全盘搜索面板：每行提供「定位」', () => expect(
+            !!mask && Array.from(mask.querySelectorAll('tbody button')).filter((b) => b.textContent === '定位').length === 2,
+            '未找到定位按钮'));
+        check('全盘搜索面板：提供批量操作入口', () => {
+            const labels = mask ? Array.from(mask.querySelectorAll('button')).map((b) => b.textContent).join('|') : '';
+            return expect(/下载选中/.test(labels) && /删除（可撤销）/.test(labels), labels);
+        });
+        Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
+        await tick(40);
+    }
+
+    {
+        // 结构化条件（ext:/type:/size:）只对本地筛选有效，原样送服务端必然搜不到
+        calls.length = 0;
+        Q.finder.openGlobal('ext:mkv S01E01');
+        let marks = 0;
+        for (let i = 0; i < 30 && marks < 2; i++) {
+            await tick(60);
+            const m = lastMask();
+            marks = m ? m.querySelectorAll('mark.qem-hl').length : 0;
+        }
+        const url = decodeURIComponent((calls.find((c) => c.url.includes('/file/search')) || {}).url || '');
+        check('全盘搜索：本地语法不送服务端', () => expect(
+            url.includes('q=S01E01') && !url.includes('ext:'), url || '（未发出搜索请求）'));
+        check('全盘搜索：结果按关键词高亮', () => expect(marks >= 2, `mark=${marks}`));
+        Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
+        await tick(40);
+    }
+
+    {
+        // 只有结构化条件时不应发请求（会白搜一次）
+        calls.length = 0;
+        Q.finder.openGlobal('ext:mkv');
+        await tick(200);
+        check('全盘搜索：无关键词时不发请求', () => expect(
+            calls.filter((c) => c.url.includes('/file/search')).length === 0,
+            `搜索请求数=${calls.filter((c) => c.url.includes('/file/search')).length}`));
+        Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
+        await tick(40);
     }
 
     /* ---------------- 结果 ---------------- */
