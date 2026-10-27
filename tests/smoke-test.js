@@ -71,6 +71,8 @@ const TXT_BODY = '这是磁链合集\nmagnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAA
 const calls = [];
 let deleted = [];              // 模拟回收站：记录被删除的 fid
 let recycleFixture = null;     // 覆盖回收站返回（测试临期预警用）
+let renameFailsOn = [];        // 这些 fid 的重命名请求返回失败
+let deleteFailsOn = [];        // 命中这些 fid 的删除请求整片失败
 // 缩略图占位（脱敏：纯色 SVG，非真实素材）
 const THUMB_DATA = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2240%22 height=%2240%22%3E%3Crect width=%2240%22 height=%2240%22 fill=%22%230067c0%22/%3E%3C/svg%3E';
 const FLAT = {};
@@ -95,9 +97,24 @@ function stubFetch(url, init) {
         const list = Object.values(FILES).flat().filter((f) => f.file_name.toLowerCase().includes(q));
         return ok({ list }, { _total: list.length, _count: list.length, _page: 1 });
     }
-    if (u.includes('/file/rename')) return ok({});
+    if (u.includes('/file/rename')) {
+        const body = JSON.parse((init && init.body) || '{}');
+        if (renameFailsOn.includes(body.fid)) {
+            return Promise.resolve({
+                ok: true, status: 200,
+                json: () => Promise.resolve({ status: 400, code: 23008, message: '模拟重命名失败（同名冲突）' }),
+            });
+        }
+        return ok({});
+    }
     if (u.includes('/file/delete')) {
         const body = JSON.parse((init && init.body) || '{}');
+        if ((body.filelist || []).some((f) => deleteFailsOn.includes(f))) {
+            return Promise.resolve({
+                ok: true, status: 200,
+                json: () => Promise.resolve({ status: 500, code: 23009, message: '模拟删除失败（服务端繁忙）' }),
+            });
+        }
         deleted.push(...(body.filelist || []));
         return ok({});
     }
@@ -1311,6 +1328,177 @@ check('规则：非法字符被清理', () => !/[\\/:*?"<>|]/.test(Q.renameRules
             `搜索请求数=${calls.filter((c) => c.url.includes('/file/search')).length}`));
         Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
         await tick(40);
+    }
+
+    /* ---------------- 失败账本与部分失败删除（v0.1.8） ---------------- */
+
+    {
+        // ① 分片删除：中间分片失败不得丢掉前面已成功的部分
+        deleted.length = 0;
+        deleteFailsOn = ['f_b'];
+        const r = await Q.api.removeChunkedSafe(['f_a', 'f_b', 'f_c'], 1);
+        deleteFailsOn = [];
+        check('分片删除：成功项与失败项分别返回', () => expect(
+            r.ok.length === 2 && r.ok.includes('f_a') && r.ok.includes('f_c')
+            && r.fails.length === 1 && r.fails[0].fid === 'f_b',
+            JSON.stringify(r)));
+        check('分片删除：成功项确实已删、失败项未删', () => expect(
+            deleted.includes('f_a') && deleted.includes('f_c') && !deleted.includes('f_b'),
+            deleted.join(',')));
+    }
+
+    {
+        // ② 关键回归：部分失败时，已成功的文件必须进入撤销栈
+        //    （修复前 removeChunked 一旦抛错，整批都不记账 → 文件删了却撤不回）
+        //    用 101 项制造两片：第 1 片 100 项成功，第 2 片 1 项失败
+        await Q.workspace.reload('0');
+        Q.breaker.reset();
+        Q.failLog.clear();
+        deleted.length = 0;
+        const many = Array.from({ length: 101 }, (_, i) => ({ fid: 't' + i, name: 't' + i, size: 0, pdir_fid: '0' }));
+        deleteFailsOn = ['t100'];
+        const n = await Q.deleteWithUndo(many, { label: '部分失败删除', skipStaleCheck: true });
+        deleteFailsOn = [];
+
+        check('部分失败删除：返回成功数而非总数', () => expect(n === 100, `n=${n}（应 100）`));
+
+        const rec = Q.opLog.list()[0];
+        check('部分失败删除：成功项写入撤销栈（最新一条）', () => expect(
+            !!rec && rec.type === 'delete' && rec.entries.length === 100, JSON.stringify(rec && rec.entries.length)));
+        check('部分失败删除：成功项带回收站 fid（可撤销）', () => expect(
+            !!rec && rec.entries.every((e) => e.recycleFid), `可撤销=${rec && rec.entries.filter((e) => e.recycleFid).length}`));
+        check('部分失败删除：撤销备注说明有失败项', () => expect(
+            !!rec && /1 项删除失败/.test(rec.note || ''), rec && rec.note));
+
+        const fb = Q.failLog.list()[0];
+        check('部分失败删除：失败项进入失败账本', () => expect(
+            !!fb && fb.action === 'delete' && fb.items.length === 1 && fb.items[0].fid === 't100',
+            JSON.stringify(fb && fb.items)));
+        check('部分失败删除：失败原因被记录', () => expect(
+            !!fb && /服务端繁忙|23009/.test(fb.items[0].error || ''), fb && fb.items[0].error));
+    }
+
+    {
+        // ③ 重命名失败 → 落账 → 重试（仍失败保留 / 成功后移除）
+        Q.failLog.clear();
+        renameFailsOn = ['f_a'];
+        const fails = await Q.api.renameMany([{ fid: 'f_a', file_name: '新A.mkv' }, { fid: 'f_c', file_name: '新C.mp4' }]);
+        check('renameMany：返回失败明细与原因', () => expect(
+            fails.length === 1 && fails[0].fid === 'f_a' && !!fails[0].error, JSON.stringify(fails)));
+
+        const b = Q.failLog.push({
+            action: 'rename',
+            label: '批量重命名',
+            items: fails.map((f) => ({ fid: f.fid, name: '旧名', file_name: f.file_name, error: f.error })),
+        });
+        check('failLog：rename 批次可重试', () => expect(
+            !!b && b.retryable === true && Q.failLog.itemCount() === 1, JSON.stringify(b && b.retryable)));
+
+        await Q.failLog.retry(b.id);
+        const after = Q.failLog.get(b.id);
+        check('重试仍失败：批次保留并更新说明', () => expect(
+            !!after && after.items.length === 1 && /仍剩 1 项失败/.test(after.note || ''),
+            JSON.stringify(after && after.note)));
+
+        renameFailsOn = [];
+        await Q.failLog.retry(b.id);
+        check('重试成功：批次自动移除', () => expect(
+            Q.failLog.get(b.id) === null && Q.failLog.itemCount() === 0,
+            `剩余批次=${Q.failLog.batchCount()}`));
+    }
+
+    {
+        // ④ 重试删除批次：走统一删除入口，成功后批次自动移除
+        Q.breaker.reset();
+        Q.failLog.clear();
+        Q.failLog.push({
+            action: 'delete', label: '搜索结果删除',
+            items: [{ fid: 'f_a', name: FLAT.f_a.file_name, size: FLAT.f_a.size, pdir: '0', error: '模拟失败' }],
+        });
+        const db = Q.failLog.list()[0];
+        const n2 = await Q.failLog.retry(db.id);
+        check('重试删除：调用统一删除入口并成功', () => expect(n2 === 1, `n=${n2}`));
+        check('重试删除：成功后批次移除', () => expect(Q.failLog.get(db.id) === null, `剩余批次=${Q.failLog.batchCount()}`));
+    }
+
+    {
+        // ⑤ 账本自身：可重试判定、单批截断、批次上限、持久化、清空
+        Q.failLog.clear();
+        const m = Q.failLog.push({ action: 'manual', label: '撤销「批量删除」', items: [{ fid: 'f_a', name: 'x', error: 'e' }] });
+        check('failLog：manual 批次标记为不可重试', () => expect(m.retryable === false));
+        await Q.failLog.retry(m.id);   // 只提示，不应抛错
+        check('failLog：不可重试批次调用重试不报错且保留', () => expect(!!Q.failLog.get(m.id)));
+
+        const oldMaxItems = Q.failLog.MAX_ITEMS;
+        Q.failLog.MAX_ITEMS = 5;
+        const big = Q.failLog.push({
+            action: 'delete',
+            items: Array.from({ length: 8 }, (_, i) => ({ fid: 'z' + i, name: 'n' + i, error: 'e' })),
+        });
+        Q.failLog.MAX_ITEMS = oldMaxItems;
+        check('failLog：单批超限截断并注明', () => expect(
+            big.items.length === 5 && /另有 3 项未记录/.test(big.note || ''),
+            `items=${big.items.length} note=${big.note}`));
+
+        const oldMaxBatch = Q.failLog.MAX_BATCH;
+        Q.failLog.MAX_BATCH = 3;
+        for (let i = 0; i < 6; i++) Q.failLog.push({ action: 'manual', items: [{ fid: 'q' + i, error: 'e' }] });
+        Q.failLog.MAX_BATCH = oldMaxBatch;
+        check('failLog：批次数按上限裁剪', () => expect(
+            Q.failLog.batchCount() === 3, `批次=${Q.failLog.batchCount()}`));
+        check('failLog：记录已落盘 localStorage', () => expect(
+            !!window.localStorage.getItem('qem_fail_log_v1'), '未写入存储'));
+
+        Q.failLog.clear();
+        check('failLog：清空后计数归零', () => expect(
+            Q.failLog.itemCount() === 0 && Q.failLog.batchCount() === 0));
+    }
+
+    {
+        // ⑤ 面板：批次列表 → 明细 → 关闭
+        Q.failLog.clear();
+        Q.failLog.push({
+            action: 'rename', label: '批量重命名',
+            items: [{ fid: 'f_a', name: '旧A.mkv', file_name: '新A.mkv', error: '同名冲突' }],
+        });
+        Q.failLog.open();
+        await tick(80);
+        const mask = lastMask();
+        const rows = mask ? mask.querySelectorAll('.qem-table tbody tr').length : 0;
+        check('失败记录面板：渲染批次行', () => expect(rows === 1, `行数=${rows}`));
+
+        const detailBtn = mask ? Array.from(mask.querySelectorAll('tbody button')).find((b) => b.textContent === '明细') : null;
+        const retryBtn = mask ? Array.from(mask.querySelectorAll('tbody button')).find((b) => b.textContent === '重试') : null;
+        check('失败记录面板：提供明细与重试入口', () => expect(!!detailBtn && !!retryBtn, `明细=${!!detailBtn} 重试=${!!retryBtn}`));
+
+        if (detailBtn) detailBtn.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+        await tick(80);
+        const m2 = lastMask();
+        const irows = m2 ? m2.querySelectorAll('.qem-table tbody tr').length : 0;
+        check('失败明细面板：列出失败项与原因', () => expect(
+            irows === 1 && /同名冲突/.test(m2.textContent), `行数=${irows}`));
+
+        Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
+        await tick(40);
+    }
+
+    {
+        // ⑥ 工作台底部失败指示：有失败才出现
+        await Q.workspace.open();
+        Q.failLog.clear();
+        Q.failLog.push({ action: 'manual', items: [{ fid: 'f_a', name: 'x', error: 'e' }] });
+        Q.workspace.render();
+        const root = shadow();
+        const btn = Array.from(root.querySelectorAll('.qem-foot button')).find((b) => /项失败/.test(b.textContent));
+        check('工作台底部：有失败时显示入口与数量', () => expect(
+            !!btn && /1 项失败/.test(btn.textContent) && btn.style.display !== 'none',
+            btn ? btn.textContent : '未找到'));
+
+        Q.failLog.clear();
+        Q.workspace.render();
+        const btn2 = Array.from(root.querySelectorAll('.qem-foot button')).find((b) => /项失败/.test(b.textContent));
+        check('工作台底部：无失败时隐藏入口', () => expect(
+            !btn2 || btn2.style.display === 'none', btn2 ? btn2.style.display : '未渲染'));
     }
 
     /* ---------------- 结果 ---------------- */

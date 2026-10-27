@@ -2,10 +2,10 @@
 // @name               夸克增强大师
 // @name:en            Quark Enhancement Master
 // @namespace          https://github.com/3ALLBUY14/quark-enhancement-master
-// @version            0.1.7
+// @version            0.1.8
 // @author             Quark port / 原版 PikPak Enhancement Master by digbug82
 // @license            AGPL-3.0-or-later
-// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、目录筛选与全盘搜索、键盘导航、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
+// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、目录筛选与全盘搜索、键盘导航、失败明细与重试、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
 // @description:en     Quark Drive enhancement: batch rename, file/folder dedup, cleanup, directory-tree export, M3U export, magnet extraction, file insight/filter, sorting, direct-link export with Aria2/IDM, PotPlayer launcher, batch share & share-import, recycle bin, reverse image search, config backup.
 // @homepage           https://github.com/3ALLBUY14/quark-enhancement-master
 // @match              https://pan.quark.cn/*
@@ -60,7 +60,7 @@
      * 0. 常量
      * ==================================================================== */
 
-    const VERSION = '0.1.7';
+    const VERSION = '0.1.8';
     const LS_CFG = 'qem_cfg_v1';
     const LS_CACHE_PREFIX = 'qem_cache_';
     const ROOT_FID = '0';
@@ -1503,6 +1503,12 @@
                         breaker.recordFail('network');
                     } else if (e instanceof ApiError) {
                         breaker.recordFail(e.kind);
+                        // 业务错误（参数/权限/同名等）与登录失效都是确定性失败，重试同样的请求
+                        // 没有意义：既浪费配额，也会把熔断计数按重试次数放大
+                        if (e.kind === 'business' || e.kind === 'auth') {
+                            if (!silent) ui.toast('请求失败：' + e.message, 'error');
+                            throw e;
+                        }
                     }
                     if (attempt < retry) { await util.sleep(300 * (attempt + 1)); continue; }
                 }
@@ -1567,8 +1573,8 @@
             return (r.data && r.data.fid) || null;
         },
 
-        async rename(fid, name) {
-            await this.raw('rename', { fid, file_name: util.sanitizeName(name) });
+        async rename(fid, name, { silent = false } = {}) {
+            await this.raw('rename', { fid, file_name: util.sanitizeName(name) }, { silent });
             return true;
         },
 
@@ -1579,10 +1585,10 @@
             return true;
         },
 
-        async remove(fids) {
+        async remove(fids, { silent = false } = {}) {
             const list = [].concat(fids).filter(Boolean);
             if (!list.length) throw new ApiError('没有需要删除的项目', -1, 'remove');
-            await this.raw('remove', { filelist: list });
+            await this.raw('remove', { filelist: list }, { silent });
             return true;
         },
 
@@ -1591,18 +1597,43 @@
             const list = [].concat(fids).filter(Boolean);
             let done = 0;
             for (let i = 0; i < list.length; i += chunk) {
-                await this.remove(list.slice(i, i + chunk));
+                await this.remove(list.slice(i, i + chunk), { silent: true });
                 done = Math.min(list.length, i + chunk);
                 if (onProgress) onProgress(done, list.length);
             }
             return list.length;
         },
 
+        /**
+         * 分片删除但**不因某一片失败而丢弃前面已成功的部分**。
+         * 返回 { ok: [fid], fails: [{ fid, error }] }，由调用方分别记账
+         * （成功 → 撤销栈，失败 → 失败账本）。整片失败时按「片内全失败」处理：
+         * 宁可少记可撤销项，也不虚报成功。
+         */
+        async removeChunkedSafe(fids, chunk = 100, onProgress = null) {
+            const list = [].concat(fids).filter(Boolean);
+            const ok = [];
+            const fails = [];
+            let done = 0;
+            for (let i = 0; i < list.length; i += chunk) {
+                const part = list.slice(i, i + chunk);
+                try {
+                    await this.remove(part, { silent: true });
+                    ok.push(...part);
+                } catch (e) {
+                    part.forEach((fid) => fails.push({ fid, error: e.message }));
+                }
+                done = Math.min(list.length, i + chunk);
+                if (onProgress) onProgress(done, list.length);
+            }
+            return { ok, fails };
+        },
+
         async renameMany(pairs, onProgress = null) {
             let done = 0;
             const fails = [];
             for (const p of pairs) {
-                try { await this.rename(p.fid, p.file_name); } catch (e) { fails.push({ ...p, error: e.message }); }
+                try { await this.rename(p.fid, p.file_name, { silent: true }); } catch (e) { fails.push({ ...p, error: e.message }); }
                 done++;
                 if (onProgress) onProgress(done, pairs.length);
                 await util.sleep(40);
@@ -1922,7 +1953,18 @@
                 pr.close();
                 this.markUndone(rec.id);
                 if (fails.length) {
-                    ui.toast(`撤销完成，但 ${fails.length} 项失败（可能已被其他操作改动）`, 'warn', 5000);
+                    failLog.push({
+                        action: 'manual',
+                        retryable: false,
+                        label: `撤销「${rec.label}」`,
+                        items: fails.map((f) => ({
+                            fid: String(f.fid || '').split(',')[0],
+                            name: f.file_name || '',
+                            error: f.error || '未知错误',
+                        })),
+                        note: '撤销过程中的失败需手动处理（文件可能已被其他操作改动）',
+                    });
+                    ui.toast(`撤销完成，但 ${fails.length} 项失败（可能已被其他操作改动，详见失败记录）`, 'warn', 6000);
                 } else {
                     ui.toast(`已撤销「${rec.label}」`);
                 }
@@ -2075,7 +2117,16 @@
                 );
                 if (!ok) return { action: 'abort', toMove: [], needRename: [], skipped: [] };
                 try { await api.removeChunked(hits.map((h) => h.fid), 100); }
-                catch (e) { ui.toast('删除同名项失败，已中止：' + e.message, 'error', 5000); return { action: 'abort', toMove: [], needRename: [], skipped: [] }; }
+                catch (e) {
+                    failLog.push({
+                        action: 'delete',
+                        label: `覆盖前删除同名项（${label}）`,
+                        items: hits.map((h) => ({ fid: h.fid, name: h.name, error: e.message })),
+                        note: '整批未执行，目标目录保持不变',
+                    });
+                    ui.toast('删除同名项失败，已中止：' + e.message, 'error', 5000);
+                    return { action: 'abort', toMove: [], needRename: [], skipped: [] };
+                }
                 return { action: 'proceed', toMove: items.map((i) => ({ fid: i.fid, item: i })), needRename: [], skipped: [] };
             }
 
@@ -2623,6 +2674,12 @@ ${warn}
      * @param {Array} items 待删除项（需含 fid / name / size / pdir_fid）
      * @returns {Promise<number>} 实际提交删除的数量
      */
+    /** 删除结果提示：全部失败时给出可操作指引，而不是「已删除 0 项」 */
+    function toastDeleted(n, okText) {
+        if (!n) return ui.toast('删除未成功，详情见「失败记录」', 'error', 5000);
+        return ui.toast(okText);
+    }
+
     async function deleteWithUndo(items, { label = '批量删除', onProgress = null, skipStaleCheck = false } = {}) {
         const list = (items || []).filter((i) => i && i.fid);
         if (!list.length) return 0;
@@ -2637,9 +2694,26 @@ ${warn}
             if (!go) return 0;
         }
 
-        await api.removeChunked(list.map((i) => i.fid), 100, onProgress);
+        const res = await api.removeChunkedSafe(list.map((i) => i.fid), 100, onProgress);
+        const okSet = new Set(res.ok);
+        const done = list.filter((i) => okSet.has(i.fid));
 
-        let entries = list.map((i) => ({ fid: i.fid, name: i.name, size: i.size, pdir: i.pdir_fid }));
+        // 关键：某一片失败时，前面已删成功的文件必须照常进撤销栈，否则「删了却撤不回」
+        if (res.fails.length) {
+            const failMap = new Map(res.fails.map((x) => [x.fid, x.error]));
+            failLog.push({
+                action: 'delete',
+                label,
+                items: list.filter((i) => failMap.has(i.fid)).map((i) => ({
+                    fid: i.fid, name: i.name, size: i.size, pdir: i.pdir_fid,
+                    error: failMap.get(i.fid),
+                })),
+                note: `${done.length}/${list.length} 项已成功删除`,
+            });
+        }
+        if (!done.length) return 0;
+
+        let entries = done.map((i) => ({ fid: i.fid, name: i.name, size: i.size, pdir: i.pdir_fid }));
         let undoable = true;
         let note = '';
         try {
@@ -2654,9 +2728,12 @@ ${warn}
             undoable = false;
             note = '未能读取回收站，无法自动撤销，请到「回收站」手动还原';
         }
+        if (res.fails.length) {
+            note = (note ? note + '；' : '') + `${res.fails.length} 项删除失败，已记入「失败记录」`;
+        }
         opLog.push({ type: 'delete', label, entries, undoable, note });
         capacityGuard.invalidate();
-        return list.length;
+        return done.length;
     }
 
     /* ======================================================================
@@ -3064,7 +3141,7 @@ ${warn}
                         try {
                             const n = await deleteWithUndo(targets, { label: '空间分析批量删除', onProgress: (d2, t2) => pr.set(d2 / t2, `已删除 ${d2}/${t2}`) });
                             pr.close();
-                            ui.toast(`已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
+                            toastDeleted(n, `已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
                             p.close(); spaceReport.open();
                             if (state.ui) await workspace.reload();
                         } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
@@ -3753,7 +3830,7 @@ ${warn}
                     try {
                         const n = await deleteWithUndo(list, { label: '搜索结果删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`) });
                         pr.close();
-                        ui.toast(`已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
+                        toastDeleted(n, `已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
                         p.close();
                     } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
                 });
@@ -3769,6 +3846,303 @@ ${warn}
             });
             if (initial) run();
             else setTimeout(() => input.focus(), 30);
+        },
+    };
+
+    /* ======================================================================
+     * 6.14 失败账本（批量操作的失败明细与重试）
+     *      批量操作此前只弹一个「失败 N 项」的 toast：N=12 时用户既不知道
+     *      是哪 12 个、也不知道为什么失败，等于无从补救。这里把失败项落账，
+     *      可看明细、可一键重试、可导出清单。与 opLog（成功侧）互补。
+     *      约定：成功项一律进 opLog（可撤销），失败项一律进 failLog（可重试）。
+     * ==================================================================== */
+
+    const FAIL_ACTION_LABEL = { rename: '重命名', move: '移动', delete: '删除', manual: '需手动处理' };
+
+    const failLog = {
+        KEY: 'qem_fail_log_v1',
+        MAX_BATCH: 30,        // 最多保留多少个批次
+        MAX_ITEMS: 1000,      // 单批最多记多少条（防止超大失败撑爆存储）
+        RETRYABLE: ['rename', 'move', 'delete'],
+
+        list() {
+            try {
+                const raw = localStorage.getItem(this.KEY);
+                const arr = raw ? JSON.parse(raw) : [];
+                return Array.isArray(arr) ? arr : [];
+            } catch (e) { return []; }
+        },
+
+        persist(arr) {
+            try {
+                localStorage.setItem(this.KEY, JSON.stringify((arr || []).slice(0, this.MAX_BATCH)));
+            } catch (e) { /* 配额满则放弃持久化，不影响本次会话内的记录 */ }
+        },
+
+        get(id) { return this.list().find((b) => b.id === id) || null; },
+        batchCount() { return this.list().length; },
+        itemCount() { return this.list().reduce((s, b) => s + ((b.items && b.items.length) || 0), 0); },
+        remove(id) { this.persist(this.list().filter((b) => b.id !== id)); },
+        clear() { this.persist([]); },
+
+        /**
+         * 记录一批失败。
+         * @param action    rename / move / delete / manual（决定能否重试）
+         * @param items     [{ fid, name, error, file_name?, size?, pdir? }]
+         * @param meta      重试所需上下文，如 { toPdir }
+         */
+        push({ action = 'manual', label = '', items = [], note = '', meta = {}, retryable = null } = {}) {
+            const clean = (items || [])
+                .filter((i) => i && (i.fid || i.name))
+                .map((i) => ({
+                    fid: i.fid || '',
+                    name: i.name || i.file_name || '',
+                    error: i.error || '未知错误',
+                    file_name: i.file_name || '',
+                    size: Number(i.size || 0),
+                    pdir: i.pdir || '',
+                }));
+            if (!clean.length) return null;
+
+            const capped = clean.slice(0, this.MAX_ITEMS);
+            const tail = clean.length > capped.length ? `另有 ${clean.length - capped.length} 项未记录（超出单批上限）` : '';
+            const batch = {
+                id: 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+                at: Date.now(),
+                action,
+                label,
+                items: capped,
+                note: [note, tail].filter(Boolean).join('　'),
+                retryable: retryable === null ? this.RETRYABLE.includes(action) : !!retryable,
+                meta,
+            };
+            const arr = this.list();
+            arr.unshift(batch);
+            this.persist(arr);
+            if (workspace.syncFoot) workspace.syncFoot();   // 立即刷新底部失败指示
+            return batch;
+        },
+
+        /** 重试一个批次：按 action 分派，成功后自动收敛该批次 */
+        async retry(id) {
+            const b = this.get(id);
+            if (!b) return ui.toast('该批次已不存在', 'warn');
+            if (!b.retryable) return ui.toast('该批次不支持自动重试，请按明细手动处理', 'warn', 4500);
+
+            if (b.action === 'delete') {
+                // 复用统一删除入口：成功的进撤销栈，仍失败的部分会被自动重新记账
+                const n = await deleteWithUndo(
+                    b.items.map((i) => ({ fid: i.fid, name: i.name, size: i.size, pdir_fid: i.pdir })),
+                    { label: '重试删除', skipStaleCheck: true },
+                );
+                if (n) this.remove(id);
+                if (workspace.render) workspace.render();
+                return n;
+            }
+
+            const pr = ui.progress('重试中');
+            try {
+                if (b.action === 'rename') {
+                    const pairs = b.items.filter((i) => i.file_name).map((i) => ({ fid: i.fid, file_name: i.file_name }));
+                    if (!pairs.length) { pr.close(); return ui.toast('该批次缺少重命名参数，无法自动重试', 'warn'); }
+                    const fails = await api.renameMany(pairs, (d, tt) => pr.set(d / tt, `已重试 ${d} / ${tt}`));
+                    pr.close();
+                    const failMap = new Map(fails.map((f) => [f.fid, f.error]));
+                    this._settle(b, b.items.filter((i) => failMap.has(i.fid)).map((i) => ({ ...i, error: failMap.get(i.fid) })));
+                } else if (b.action === 'move') {
+                    const to = b.meta && b.meta.toPdir;
+                    if (!to) { pr.close(); return ui.toast('该批次缺少目标目录，无法自动重试', 'warn'); }
+                    const fids = b.items.map((i) => i.fid).filter(Boolean);
+                    try {
+                        await api.move(fids, to);
+                        pr.close();
+                        this._settle(b, []);
+                    } catch (e) {
+                        pr.close();
+                        this._settle(b, b.items.map((i) => ({ ...i, error: e.message })));
+                    }
+                } else {
+                    pr.close();
+                    ui.toast('该批次不支持自动重试', 'warn');
+                }
+            } catch (e) {
+                pr.close();
+                ui.toast('重试失败：' + e.message, 'error');
+            }
+        },
+
+        /** 重试后收敛：全成功则移除批次，仍有失败则更新为剩余项 */
+        _settle(batch, rest) {
+            if (!rest.length) {
+                this.remove(batch.id);
+                ui.toast('重试成功，该批次已从失败记录移除');
+            } else {
+                const arr = this.list();
+                const idx = arr.findIndex((x) => x.id === batch.id);
+                if (idx >= 0) {
+                    arr[idx] = { ...arr[idx], at: Date.now(), items: rest.slice(0, this.MAX_ITEMS), note: `重试后仍剩 ${rest.length} 项失败` };
+                    this.persist(arr);
+                }
+                ui.toast(`重试完成，仍剩 ${rest.length} 项失败`, 'warn', 4500);
+            }
+            if (workspace.syncFoot) workspace.syncFoot();
+        },
+
+        /** 批次列表面板 */
+        open() {
+            const p = ui.panel({ title: '失败记录', size: 'lg', buttons: [{ label: t('close'), onClick: (a) => a.close() }] });
+            const tip = document.createElement('div');
+            tip.className = 'muted';
+            const listBox = document.createElement('div');
+            listBox.className = 'qem-content';
+            listBox.style.marginTop = '10px';
+            const acts = document.createElement('div');
+            acts.className = 'row';
+            acts.style.marginTop = '10px';
+            acts.style.flexWrap = 'wrap';
+            p.body.append(tip, listBox, acts);
+
+            const render = () => {
+                const arr = this.list();
+                tip.textContent = arr.length
+                    ? `共 ${arr.length} 个批次、${this.itemCount()} 项失败。失败项不进「操作历史」，成功部分仍可正常撤销。`
+                    : '没有失败记录。批量操作中若有项目失败，会记录在这里（含错误原因），可一键重试。';
+                listBox.innerHTML = '';
+                acts.innerHTML = '';
+                if (!arr.length) {
+                    const e = document.createElement('div');
+                    e.className = 'qem-empty';
+                    e.textContent = '暂无失败记录';
+                    listBox.appendChild(e);
+                    return;
+                }
+
+                const rows = arr.map((b) => ({
+                    ...b,
+                    timeText: util.ts(b.at),
+                    actionText: FAIL_ACTION_LABEL[b.action] || b.action,
+                    countText: b.items.length,
+                    firstErr: (b.items[0] && b.items[0].error) || '',
+                }));
+                const tb = ui.table([
+                    { key: 'timeText', label: '时间' },
+                    { key: 'actionText', label: '操作' },
+                    { key: 'countText', label: '失败项', align: 'right' },
+                    { key: 'firstErr', label: '首个错误', render: (v) => `<span class="muted">${util.escapeHtml(v)}</span>` },
+                    { key: 'act', label: '操作', render: (v, row) => {
+                        const box = document.createElement('div');
+                        box.className = 'row';
+                        const detail = document.createElement('button');
+                        detail.textContent = '明细';
+                        detail.addEventListener('click', () => failLog.showBatch(row.id));
+                        const retry = document.createElement('button');
+                        retry.textContent = '重试';
+                        retry.className = 'primary';
+                        retry.disabled = !row.retryable;
+                        retry.title = row.retryable ? '按同一参数重试仍失败的项' : '该批次不支持自动重试';
+                        retry.addEventListener('click', async () => {
+                            retry.disabled = true;
+                            await failLog.retry(row.id);
+                            render();
+                            if (state.ui && state.ui.el && state.ui.el.isConnected) workspace.render();
+                        });
+                        const del = document.createElement('button');
+                        del.className = 'danger';
+                        del.textContent = '移除';
+                        del.title = '仅移除这条记录，不影响网盘文件';
+                        del.addEventListener('click', () => { failLog.remove(row.id); render(); });
+                        box.append(detail, retry, del);
+                        return box;
+                    } },
+                ], rows, { maxHeight: '48vh' });
+                listBox.appendChild(tb.el);
+
+                const mk = (label, cls, fn) => {
+                    const b = document.createElement('button');
+                    b.textContent = label;
+                    if (cls) b.className = cls;
+                    b.addEventListener('click', fn);
+                    acts.appendChild(b);
+                    return b;
+                };
+                mk('导出全部明细', '', () => this.exportAll());
+                mk('清空记录', 'danger', async () => {
+                    const ok = await ui.confirm('清空全部失败记录？仅清除记录，不影响网盘中的文件。', { danger: true, okText: '清空' });
+                    if (!ok) return;
+                    this.clear();
+                    render();
+                    if (workspace.syncFoot) workspace.syncFoot();
+                });
+            };
+
+            render();
+        },
+
+        /** 单批明细面板 */
+        showBatch(id) {
+            const b = this.get(id);
+            if (!b) return ui.toast('该批次已不存在', 'warn');
+            const p = ui.panel({
+                title: `失败明细 · ${FAIL_ACTION_LABEL[b.action] || b.action}`, size: 'lg',
+                buttons: [{ label: t('close'), onClick: (a) => a.close() }],
+            });
+            const tip = document.createElement('div');
+            tip.className = 'muted';
+            tip.textContent = `${util.ts(b.at)}　·　${b.items.length} 项失败`
+                + (b.note ? `　·　${b.note}` : '')
+                + (b.retryable ? '' : '　·　该批次不支持自动重试，请手动处理');
+            const listBox = document.createElement('div');
+            listBox.className = 'qem-content';
+            listBox.style.marginTop = '10px';
+            const acts = document.createElement('div');
+            acts.className = 'row';
+            acts.style.marginTop = '10px';
+            acts.style.flexWrap = 'wrap';
+
+            let picked = [];
+            const tb = ui.table([
+                { key: 'name', label: '名称', render: (v, row) => util.escapeHtml(v || row.fid) },
+                { key: 'error', label: '失败原因', render: (v) => `<span class="muted">${util.escapeHtml(v || '')}</span>` },
+            ], b.items, { maxHeight: '46vh', selectable: true, onSelectionChange: (rs) => { picked = rs; } });
+            listBox.appendChild(tb.el);
+
+            const mk = (label, cls, fn, disabled = false) => {
+                const btn = document.createElement('button');
+                btn.textContent = label;
+                if (cls) btn.className = cls;
+                btn.disabled = disabled;
+                btn.addEventListener('click', fn);
+                acts.appendChild(btn);
+                return btn;
+            };
+            mk('重试本批', 'primary', async () => {
+                await failLog.retry(b.id);
+                p.close();
+                failLog.open();
+            }, !b.retryable);
+            mk('复制清单', '', () => {
+                const list = picked.length ? picked : b.items;
+                util.copy(list.map((i) => ((i.name || i.fid) + '\t' + (i.error || ''))).join('\n'), `已复制 ${list.length} 条`);
+            });
+            mk('导出明细', '', () => {
+                const list = picked.length ? picked : b.items;
+                const text = list.map((i) => `${i.name || i.fid}\t${i.error || ''}`).join('\n');
+                util.saveTextFile(`失败明细_${new Date().toISOString().slice(0, 10)}.txt`, text, 'text/plain');
+            });
+            p.body.append(tip, listBox, acts);
+        },
+
+        /** 导出全部批次为纯文本（按批次分组，便于对照处理） */
+        exportAll() {
+            const arr = this.list();
+            if (!arr.length) return ui.toast('没有可导出的记录', 'warn');
+            const lines = [];
+            arr.forEach((b) => {
+                lines.push(`# ${util.ts(b.at)}　${FAIL_ACTION_LABEL[b.action] || b.action}　${b.items.length} 项失败${b.note ? '　' + b.note : ''}`);
+                b.items.forEach((i) => lines.push(`  - ${i.name || i.fid}\t${i.error || ''}`));
+                lines.push('');
+            });
+            util.saveTextFile(`失败记录_${new Date().toISOString().slice(0, 10)}.txt`, lines.join('\n'), 'text/plain');
         },
     };
 
@@ -3926,6 +4300,14 @@ ${warn}
             footInfo.className = 'muted';
             footInfo.style.marginRight = 'auto';
             p.foot.prepend(footInfo);
+
+            // 失败记录入口：仅在存在失败时出现，避免常驻噪音
+            const failBtn = document.createElement('button');
+            failBtn.className = 'danger';
+            failBtn.style.display = 'none';
+            failBtn.title = '查看批量操作中失败的条目与原因，可一键重试';
+            failBtn.addEventListener('click', () => failLog.open());
+            p.foot.insertBefore(failBtn, footInfo.nextSibling);
 
             const render = () => {
                 const vp = viewPref.get(state.cwd);
@@ -4130,6 +4512,9 @@ ${warn}
 
             const foot = () => {
                 const undoRec = opLog.latestUndoable();
+                const failCount = failLog.itemCount();
+                failBtn.style.display = failCount ? '' : 'none';
+                if (failCount) failBtn.textContent = `⚠ ${failCount} 项失败`;
                 footInfo.textContent = t('selected', { n: sel.count() })
                     + '　|　共 ' + state.items.length + ' 项'
                     + (state.stale ? `　|　⚠️ 当前为缓存数据（${util.ts(state.stale.at)}）` : '')
@@ -4271,7 +4656,7 @@ ${warn}
             try {
                 const n = await deleteWithUndo(items, { label: '批量删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d} / ${tt}`) });
                 pr.close();
-                ui.toast(`已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
+                toastDeleted(n, `已移入回收站 ${n} 项，可通过 Alt+Z 撤销`);
                 await workspace.reload();
             } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
         },
@@ -4624,7 +5009,7 @@ ${warn}
                     const pr = ui.progress('删除中');
                     try {
                         const n = await deleteWithUndo(matched, { label: '文件透视删除', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`) });
-                        pr.close(); ui.toast(`已移入回收站 ${n} 项`);
+                        pr.close(); toastDeleted(n, `已移入回收站 ${n} 项`);
                         pool = null; await run(); await workspace.reload();
                     } catch (e) { pr.close(); ui.toast('失败：' + e.message, 'error'); }
                 }, 'danger');
@@ -4884,7 +5269,18 @@ ${warn}
                     }
                     pr.close();
                     if (fails.length) {
-                        ui.toast(`完成 ${rows.length - fails.length} 项，失败 ${fails.length} 项`, 'warn', 4000);
+                        failLog.push({
+                            action: 'rename',
+                            label: '批量重命名',
+                            items: fails.map((f) => {
+                                const row = rows.find((r) => r.fid === f.fid);
+                                return { fid: f.fid, name: (row && row.old) || f.file_name || '', file_name: f.file_name, error: f.error };
+                            }),
+                            note: `${okRows.length}/${rows.length} 项已重命名`,
+                        });
+                    }
+                    if (fails.length) {
+                        ui.toast(`完成 ${rows.length - fails.length} 项，失败 ${fails.length} 项（可查看失败记录并重试）`, 'warn', 5000);
                     } else {
                         ui.toast(`已重命名 ${rows.length} 项`);
                     }
@@ -5073,7 +5469,7 @@ ${warn}
                     try {
                         const dupes = groups.flatMap((g) => g.dupes);
                         const n = await deleteWithUndo(dupes, { label: '查重清理', onProgress: (d, tt) => pr.set(d / tt, `已删除 ${d}/${tt}`) });
-                        pr.close(); ui.toast(`已清理 ${n} 个冗余文件`);
+                        pr.close(); toastDeleted(n, `已清理 ${n} 个冗余文件`);
                         await workspace.reload();
                     } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
                 });
@@ -5320,7 +5716,7 @@ ${warn}
                     const pr3 = ui.progress('删除中');
                     try {
                         const n = await deleteWithUndo(results, { label: '资源清理', onProgress: (d, tt) => pr3.set(d / tt, `已删除 ${d}/${tt}`) });
-                        pr3.close(); ui.toast(`已清理 ${n} 项`);
+                        pr3.close(); toastDeleted(n, `已清理 ${n} 项`);
                         indexCache.dropAll();
                         await workspace.reload();
                     } catch (e) { pr3.close(); ui.toast('失败：' + e.message, 'error'); }
@@ -6496,6 +6892,7 @@ ${warn}
                     mk('导出配置', () => { util.saveTextFile(`qem_config_${Date.now()}.json`, config.export(), 'application/json'); });
                     mk('配置版本历史', () => { p.close(); cfgHistory.open(); });
                     mk('空间占用分析', () => { p.close(); spaceReport.open(); });
+                    mk('失败记录（查看 / 重试）', () => { p.close(); failLog.open(); });
                     mk('跨账号迁移校验', () => { p.close(); crossCheck.exportFlow(); });
                     mk('清理目录级视图偏好', () => { viewPref.clearAll(); ui.toast('已清理'); });
                     mk('导入配置', () => {
@@ -6758,6 +7155,7 @@ ${warn}
             GM_registerMenuCommand('解析分享链接', () => shareTool.parse());
             GM_registerMenuCommand('我的分享', () => shareTool.myList());
             GM_registerMenuCommand('全盘搜索', () => finder.openGlobal());
+            GM_registerMenuCommand('失败记录', () => failLog.open());
             GM_registerMenuCommand('空间占用分析', () => spaceReport.open());
             GM_registerMenuCommand('跨账号校验：导出账号清单', () => crossCheck.exportFlow());
             GM_registerMenuCommand('跨账号校验：导入并比对', () => crossCheck.compareFlow());
@@ -6806,7 +7204,7 @@ ${warn}
                 config, api, guard, breaker, EP, util, fileModel, scanner, indexCache, ui,
                 renameRules, parseSize, nameSimilarity,
                 opLog, conflict, capacityGuard, snapshot, cfgHistory, spaceReport, deleteWithUndo, crossCheck, viewPref,
-                workspace, finder, dedup, cleanup, exporter, shareTool, trash, settings,
+                workspace, finder, failLog, dedup, cleanup, exporter, shareTool, trash, settings,
                 downloader, player, imgSearch, insight, preview, property, picker, state, sel,
                 fab, shortcutMgr,
             };
