@@ -1,6 +1,6 @@
 {
   "name": "quark-enhancement-master",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "夸克网盘增强用户脚本（移植自 PikPak Enhancement Master）",
   "license": "AGPL-3.0-or-later",
   "private": true,

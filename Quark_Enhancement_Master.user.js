@@ -2,10 +2,10 @@
 // @name               夸克增强大师
 // @name:en            Quark Enhancement Master
 // @namespace          https://github.com/3ALLBUY14/quark-enhancement-master
-// @version            0.2.0
+// @version            0.2.1
 // @author             Quark port / 原版 PikPak Enhancement Master by digbug82
 // @license            AGPL-3.0-or-later
-// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、目录筛选与全盘搜索、键盘导航、失败明细与重试、常用目录书签与前进后退、长任务可取消、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
+// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、目录筛选与全盘搜索、键盘导航、失败明细与重试、常用目录书签与前进后退、拖拽移动、搜索历史、按账号隔离本机数据、长任务可取消、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
 // @description:en     Quark Drive enhancement: batch rename, file/folder dedup, cleanup, directory-tree export, M3U export, magnet extraction, file insight/filter, sorting, direct-link export with Aria2/IDM, PotPlayer launcher, batch share & share-import, recycle bin, reverse image search, config backup.
 // @homepage           https://github.com/3ALLBUY14/quark-enhancement-master
 // @match              https://pan.quark.cn/*
@@ -60,7 +60,7 @@
      * 0. 常量
      * ==================================================================== */
 
-    const VERSION = '0.2.0';
+    const VERSION = '0.2.1';
     const LS_CFG = 'qem_cfg_v1';
     const LS_CACHE_PREFIX = 'qem_cache_';
     const ROOT_FID = '0';
@@ -371,6 +371,7 @@
             history: 'Alt+H',
         },
         fab: { pos: 'br', x: null, y: null, hidden: false },
+        accountScope: true,               // 本机数据按账号隔离（识别不到账号时自动失效）
     };
 
     const config = {
@@ -469,9 +470,175 @@
         },
     };
 
+    /* ======================================================================
+     * 2.1 账号作用域（本机数据按账号隔离）
+     *      为什么放在这么靠前：索引缓存、操作历史、书签等存储键在本文件
+     *      初始化时就要生成，账号作用域必须先于它们定义。
+     *      设计原则：识别不到账号就**不假装隔离**——key 原样返回，设置面板
+     *      明确写「未识别」，而不是给用户一个假的"已隔离"。
+     * ==================================================================== */
+
+    const accountScope = {
+        KEY: 'qem_account_v1',
+        id: '',
+        ready: false,
+        _pending: null,
+
+        /** 同步读上次识别结果：启动阶段先用缓存，避免首屏数据写错作用域 */
+        loadCached() {
+            try {
+                const d = JSON.parse(localStorage.getItem(this.KEY) || 'null');
+                if (d && typeof d.id === 'string' && d.id) {
+                    this.id = d.id;
+                    this.ready = true;
+                }
+            } catch (e) { /* 忽略损坏的缓存 */ }
+            return this.id;
+        },
+
+        /** 是否真的在隔离：需要已识别账号，且用户没关掉开关 */
+        enabled() { return !!this.id && config.get('accountScope', true) !== false; },
+
+        /**
+         * 生成实际存储键。未识别账号 / 关闭隔离时原样返回（数据仍是全局的，
+         * 设置里会明示），绝不返回一个看起来隔离其实没隔离的键。
+         */
+        key(base) { return this.enabled() ? `${base}@${this.id}` : base; },
+
+        /** 异步识别：优先问接口（换号后刷新页面即可纠正），失败退回缓存值 */
+        async refresh() {
+            if (this._pending) return this._pending;
+            this._pending = (async () => {
+                try {
+                    const c = await api.capacity({ silent: true });   // 启动时探测，失败不该弹错
+                    const uid = String((c && c.uid) || '').replace(/[^\w-]/g, '').slice(0, 24);
+                    if (!uid) return this.id;
+                    const prev = this.id;
+                    const changed = uid !== prev;
+                    this.id = uid;
+                    this.ready = true;
+                    try { localStorage.setItem(this.KEY, JSON.stringify({ id: uid, at: Date.now() })); } catch (e) { /* 忽略 */ }
+                    if (changed) {
+                        // 作用域变了：内存里按旧账号算出来的路径索引与目录历史必须作废
+                        finder.invalidateIndex();
+                        navTrail.reset();
+                        if (prev) ui.toast('检测到账号变化，本机数据已切换到当前账号', 'info', 5000);
+                        if (state.ui && workspace.render) workspace.render();
+                    }
+                    return uid;
+                } catch (e) {
+                    return this.id;   // 接口失败：沿用缓存，不做任何"假设性"隔离
+                }
+            })();
+            try { return await this._pending; } finally { this._pending = null; }
+        },
+
+        /** 需要隔离的本机数据键前缀（配置本身不隔离：是跨账号通用的使用偏好） */
+        SCOPED_PREFIXES: [
+            'qem_cache_idx_', 'qem_bookmarks_v1', 'qem_recent_dirs_v1', 'qem_search_hist_v1',
+            'qem_ophistory_v1', 'qem_fail_log_v1', 'qem_snapshots_v1', 'qem_cfg_history_v1',
+        ],
+
+        /**
+         * 把「无后缀」的旧数据复制到当前账号作用域。手动触发：自动迁移会把
+         * 上一个账号的数据悄悄变成当前账号的，这是错的。原键保留不删。
+         */
+        migrate() {
+            if (!this.enabled()) return { moved: 0, reason: 'not-ready' };
+            let moved = 0;
+            let skipped = 0;
+            try {
+                Object.keys(localStorage).forEach((k) => {
+                    if (k.includes('@')) return;
+                    if (!this.SCOPED_PREFIXES.some((p) => k === p || k.startsWith(p))) return;
+                    const target = `${k}@${this.id}`;
+                    if (localStorage.getItem(target) !== null) { skipped++; return; }
+                    const val = localStorage.getItem(k);
+                    if (val === null) return;
+                    localStorage.setItem(target, val);
+                    moved++;
+                });
+            } catch (e) { return { moved, skipped, reason: 'error' }; }
+            return { moved, skipped };
+        },
+
+        /** 面板：当前识别状态 / 隔离开关 / 手动迁移 */
+        open() {
+            const p = ui.panel({ title: '账号与本机数据', size: 'sm', buttons: [{ label: t('close'), onClick: (a) => a.close() }] });
+            const info = document.createElement('div');
+            info.className = 'col';
+            const acts = document.createElement('div');
+            acts.className = 'row';
+            acts.style.flexWrap = 'wrap';
+            acts.style.marginTop = '10px';
+            p.body.append(info, acts);
+
+            const render = () => {
+                info.innerHTML = '';
+                const identified = !!accountScope.id;
+                const on = accountScope.enabled();
+                const rows = [
+                    ['识别到的账号标识', identified ? accountScope.id : '未识别（接口未返回 uid）'],
+                    ['本机数据隔离', on ? '已启用：书签 / 索引 / 历史 / 快照按账号分库存放' : (identified ? '已关闭（设置中可开启）' : '未启用（拿不到账号标识，数据为全局共用）')],
+                    ['隔离范围', '书签、最近访问、搜索历史、目录索引缓存、操作历史、失败记录、目录快照、配置版本'],
+                    ['不受影响', '配置项（使用偏好，跨账号通用）'],
+                ];
+                rows.forEach(([k, v]) => {
+                    const row = document.createElement('div');
+                    row.className = 'row';
+                    const a = document.createElement('div');
+                    a.style.minWidth = '110px';
+                    a.style.color = 'var(--qem-text-soft)';
+                    a.textContent = k;
+                    const b = document.createElement('div');
+                    b.className = 'grow';
+                    b.textContent = v;
+                    row.append(a, b);
+                    info.appendChild(row);
+                });
+
+                acts.innerHTML = '';
+                const mk = (label, cls, fn, disabled = false) => {
+                    const btn = document.createElement('button');
+                    btn.textContent = label;
+                    if (cls) btn.className = cls;
+                    btn.disabled = disabled;
+                    btn.addEventListener('click', fn);
+                    acts.appendChild(btn);
+                    return btn;
+                };
+                mk(identified ? '重新识别账号' : '识别账号', '', async () => {
+                    accountScope.id = '';
+                    await accountScope.refresh();
+                    ui.toast(accountScope.id ? `已识别账号：${accountScope.id}` : '接口未返回账号标识，无法按账号隔离', accountScope.id ? 'info' : 'warn', 5000);
+                    render();
+                });
+                mk(config.get('accountScope', true) === false ? '开启数据隔离' : '关闭数据隔离', '', () => {
+                    config.set('accountScope', config.get('accountScope', true) === false);
+                    ui.toast(config.get('accountScope', true) === false ? '已关闭：后续数据写入全局' : '已开启：后续数据按账号分库', 'info', 4500);
+                    render();
+                }, !identified);
+                mk('迁移旧数据到当前账号', '', () => {
+                    const r = accountScope.migrate();
+                    if (r.reason) return ui.toast('请先识别账号', 'warn');
+                    ui.toast(`已复制 ${r.moved} 项旧数据到当前账号${r.skipped ? `（${r.skipped} 项已存在，未覆盖）` : ''}`, 'info', 5500);
+                }, !accountScope.enabled());
+
+                const tip = document.createElement('div');
+                tip.className = 'muted';
+                tip.style.marginTop = '10px';
+                tip.textContent = '说明：隔离键形如 qem_bookmarks_v1@<uid>。旧版本数据没有后缀，'
+                    + '如需要可在上面点「迁移」复制过来（原数据保留，可随时回退）。换号后如未自动识别，点「重新识别账号」或刷新页面。';
+                info.appendChild(tip);
+            };
+
+            render();
+        },
+    };
+
     /** 全盘索引缓存（跨会话，用于查重/透视免重复扫描） */
     const indexCache = {
-        key(pdir) { return LS_CACHE_PREFIX + 'idx_' + pdir; },
+        key(pdir) { return accountScope.key(LS_CACHE_PREFIX + 'idx_' + pdir); },
         read(pdir) {
             try {
                 const raw = localStorage.getItem(this.key(pdir));
@@ -794,6 +961,20 @@
 .qem-dark .qem-table mark.qem-hl { background: rgba(255,205,80,.26); color: var(--fg); }
 /* 键盘游标行 */
 .qem-table tbody tr.cur { outline: 2px solid var(--pri); outline-offset: -2px; }
+
+/* —— 拖拽移动 —— */
+.qem-table tbody tr.dragging { opacity: .45; }
+.qem-table tbody tr.drop-target {
+  outline: 2px dashed var(--pri); outline-offset: -2px;
+  background: var(--pri-soft); cursor: copy;
+}
+.qem-table tbody tr.drop-denied {
+  outline: 2px dashed var(--err); outline-offset: -2px;
+  background: var(--err-soft); cursor: not-allowed;
+}
+.qem-crumb button.drop-target, .qem-books button.drop-target {
+  background: var(--pri-soft); border-color: var(--pri); box-shadow: inset 0 0 0 1px var(--pri);
+}
 
 @media (max-width: 720px) {
   .qem-search .hint { display: none; }
@@ -1690,10 +1871,16 @@
             return (Array.isArray(r.data) ? r.data : []).map((x) => ({ fid: x.fid, url: x.download_url, md5: x.md5 || '' }));
         },
 
-        async capacity() {
-            const r = await this.raw('capacity', {});
+        async capacity({ silent = false } = {}) {
+            const r = await this.raw('capacity', {}, { silent });
             const d = r.data || {};
-            return { total: Number(d.total_capacity || d.capacity || 0), used: Number(d.use_capacity || d.used || 0), vip: d.member_type || '' };
+            return {
+                total: Number(d.total_capacity || d.capacity || 0),
+                used: Number(d.use_capacity || d.used || 0),
+                vip: d.member_type || '',
+                // 账号指纹：不同账号数据需分库存放，取不到就留空（不猜）
+                uid: String(d.uid || d.user_id || d.member_id || ''),
+            };
         },
 
         /** 回收站条目（用于把刚删除的项目映射为可还原的回收站 fid） */
@@ -1860,7 +2047,7 @@
 
         list() {
             try {
-                const raw = localStorage.getItem(OP_KEY);
+                const raw = localStorage.getItem(accountScope.key(OP_KEY));
                 const arr = raw ? JSON.parse(raw) : [];
                 return Array.isArray(arr) ? arr : [];
             } catch (e) { return []; }
@@ -1869,7 +2056,7 @@
         persist(arr) {
             const max = Math.max(1, Number(config.get('undo.max', 20)) || 20);
             const trimmed = arr.slice(0, max);
-            try { localStorage.setItem(OP_KEY, JSON.stringify(trimmed)); } catch (e) { /* 配额满则丢弃历史 */ }
+            try { localStorage.setItem(accountScope.key(OP_KEY), JSON.stringify(trimmed)); } catch (e) { /* 配额满则丢弃历史 */ }
             return trimmed;
         },
 
@@ -1919,7 +2106,7 @@
         },
 
         clear() {
-            try { localStorage.removeItem(OP_KEY); } catch (e) { /* 忽略 */ }
+            try { localStorage.removeItem(accountScope.key(OP_KEY)); } catch (e) { /* 忽略 */ }
         },
 
         /**
@@ -2314,7 +2501,7 @@
 
         list() {
             try {
-                const raw = localStorage.getItem(snapKey);
+                const raw = localStorage.getItem(accountScope.key(snapKey));
                 const arr = raw ? JSON.parse(raw) : [];
                 return Array.isArray(arr) ? arr : [];
             } catch (e) { return []; }
@@ -2323,7 +2510,7 @@
         persist(arr) {
             const trimmed = arr.slice(0, this.MAX);
             try {
-                localStorage.setItem(snapKey, JSON.stringify(trimmed));
+                localStorage.setItem(accountScope.key(snapKey), JSON.stringify(trimmed));
                 return true;
             } catch (e) {
                 ui.toast('快照保存失败：本地存储空间不足，请先删除旧快照', 'error', 5000);
@@ -2332,7 +2519,7 @@
         },
 
         remove(id) { this.persist(this.list().filter((s) => s.id !== id)); },
-        clear() { try { localStorage.removeItem(snapKey); } catch (e) { /* 忽略 */ } },
+        clear() { try { localStorage.removeItem(accountScope.key(snapKey)); } catch (e) { /* 忽略 */ } },
         get(id) { return this.list().find((s) => s.id === id) || null; },
 
         /** 压缩存储：数组比对象省约一半空间 */
@@ -2827,7 +3014,7 @@ ${warn}
 
         list() {
             try {
-                const raw = localStorage.getItem(cfgKey);
+                const raw = localStorage.getItem(accountScope.key(cfgKey));
                 const arr = raw ? JSON.parse(raw) : [];
                 return Array.isArray(arr) ? arr : [];
             } catch (e) { return []; }
@@ -2835,7 +3022,7 @@ ${warn}
 
         persist(arr) {
             const trimmed = arr.slice(0, this.MAX);
-            try { localStorage.setItem(cfgKey, JSON.stringify(trimmed)); return true; }
+            try { localStorage.setItem(accountScope.key(cfgKey), JSON.stringify(trimmed)); return true; }
             catch (e) { ui.toast('配置历史保存失败：本地存储不足，请清理历史', 'error', 5000); return false; }
         },
 
@@ -3006,7 +3193,7 @@ ${warn}
             clr.addEventListener('click', async () => {
                 const ok = await ui.confirm(`清空全部 ${arr.length} 版配置记录？不影响当前配置。`, { danger: true, okText: '清空' });
                 if (!ok) return;
-                try { localStorage.removeItem(cfgKey); } catch (e) { /* 忽略 */ }
+                try { localStorage.removeItem(accountScope.key(cfgKey)); } catch (e) { /* 忽略 */ }
                 p.close(); cfgHistory.open();
             });
             acts.append(auto, clr);
@@ -3675,6 +3862,32 @@ ${warn}
             return bits.join('　·　');
         },
 
+        /** 全盘搜索历史（关键词去重前移，上限 12 条） */
+        HIST_KEY: 'qem_search_hist_v1',
+        MAX_HIST: 12,
+
+        histList() {
+            try {
+                const raw = localStorage.getItem(accountScope.key(this.HIST_KEY));
+                const arr = raw ? JSON.parse(raw) : [];
+                return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string' && x) : [];
+            } catch (e) { return []; }
+        },
+
+        histPush(q) {
+            const kw = String(q || '').trim();
+            if (!kw) return;
+            const arr = this.histList().filter((x) => x !== kw);
+            arr.unshift(kw);
+            try {
+                localStorage.setItem(accountScope.key(this.HIST_KEY), JSON.stringify(arr.slice(0, this.MAX_HIST)));
+            } catch (e) { /* 配额满则放弃记录，不影响搜索 */ }
+        },
+
+        histClear() {
+            try { localStorage.removeItem(accountScope.key(this.HIST_KEY)); } catch (e) { /* 忽略 */ }
+        },
+
         /** fid → 条目 的索引快照（一次全扫，供 pathLabel 逐行调用；TTL 20 秒） */
         _idx: { at: 0, map: new Map() },
 
@@ -3777,12 +3990,38 @@ ${warn}
             acts.className = 'row';
             acts.style.marginTop = '10px';
             acts.style.flexWrap = 'wrap';
-            p.body.append(bar, stat, listBox, acts);
+            const histBar = document.createElement('div');
+            histBar.className = 'qem-books';
+            histBar.style.marginTop = '8px';
+            p.body.append(bar, histBar, stat, listBox, acts);
 
             let rows = [];
             let picked = [];
             let running = false;
             const target = () => (picked.length ? picked : rows);
+
+            const renderHist = () => {
+                const hist = finder.histList();
+                histBar.innerHTML = '';
+                histBar.style.display = hist.length ? '' : 'none';
+                if (!hist.length) return;
+                const lab = document.createElement('span');
+                lab.className = 'lab';
+                lab.textContent = '🕘';
+                histBar.appendChild(lab);
+                hist.slice(0, 8).forEach((h) => {
+                    const b = document.createElement('button');
+                    b.textContent = h;
+                    b.title = `再搜「${h}」`;
+                    b.addEventListener('click', () => { input.value = h; run(); });
+                    histBar.appendChild(b);
+                });
+                const clr = document.createElement('button');
+                clr.className = 'ghost';
+                clr.textContent = '清空';
+                clr.addEventListener('click', () => { finder.histClear(); renderHist(); });
+                histBar.appendChild(clr);
+            };
 
             const run = async () => {
                 const q = input.value.trim();
@@ -3803,6 +4042,8 @@ ${warn}
                 try {
                     const r = await api.searchAll(kw, { max: 300, onProgress: (n, tt) => { stat.textContent = `已获取 ${n} / ${tt}`; } });
                     rows = r.items;
+                    finder.histPush(q);
+                    renderHist();
                     let desc = finder.describe(finder.parse(q));
                     if (kw !== q) desc = '';   // 服务端按关键词搜，结构化条件不再成立
                     stat.textContent = `找到 ${rows.length} 项`
@@ -3918,6 +4159,7 @@ ${warn}
             input.addEventListener('keydown', (e) => {
                 if (e.key === 'Enter') { e.preventDefault(); run(); }
             });
+            renderHist();
             if (initial) run();
             else setTimeout(() => input.focus(), 30);
         },
@@ -3941,7 +4183,7 @@ ${warn}
 
         list() {
             try {
-                const raw = localStorage.getItem(this.KEY);
+                const raw = localStorage.getItem(accountScope.key(this.KEY));
                 const arr = raw ? JSON.parse(raw) : [];
                 return Array.isArray(arr) ? arr : [];
             } catch (e) { return []; }
@@ -3949,7 +4191,7 @@ ${warn}
 
         persist(arr) {
             try {
-                localStorage.setItem(this.KEY, JSON.stringify((arr || []).slice(0, this.MAX_BATCH)));
+                localStorage.setItem(accountScope.key(this.KEY), JSON.stringify((arr || []).slice(0, this.MAX_BATCH)));
             } catch (e) { /* 配额满则放弃持久化，不影响本次会话内的记录 */ }
         },
 
@@ -4246,7 +4488,7 @@ ${warn}
         /* ---------- 书签 ---------- */
         list() {
             try {
-                const raw = localStorage.getItem(BOOK_KEY);
+                const raw = localStorage.getItem(accountScope.key(BOOK_KEY));
                 const arr = raw ? JSON.parse(raw) : [];
                 return Array.isArray(arr) ? arr.filter((b) => b && b.fid) : [];
             } catch (e) { return []; }
@@ -4254,7 +4496,7 @@ ${warn}
 
         persist(arr) {
             try {
-                localStorage.setItem(BOOK_KEY, JSON.stringify((arr || []).slice(0, this.MAX_BOOK)));
+                localStorage.setItem(accountScope.key(BOOK_KEY), JSON.stringify((arr || []).slice(0, this.MAX_BOOK)));
             } catch (e) { /* 配额满则放弃持久化，不影响本次会话 */ }
         },
 
@@ -4336,7 +4578,7 @@ ${warn}
         /* ---------- 最近访问 ---------- */
         recent() {
             try {
-                const raw = localStorage.getItem(RECENT_KEY);
+                const raw = localStorage.getItem(accountScope.key(RECENT_KEY));
                 const arr = raw ? JSON.parse(raw) : [];
                 return Array.isArray(arr) ? arr.filter((r) => r && r.fid) : [];
             } catch (e) { return []; }
@@ -4344,7 +4586,7 @@ ${warn}
 
         persistRecent(arr) {
             try {
-                localStorage.setItem(RECENT_KEY, JSON.stringify((arr || []).slice(0, this.MAX_RECENT)));
+                localStorage.setItem(accountScope.key(RECENT_KEY), JSON.stringify((arr || []).slice(0, this.MAX_RECENT)));
             } catch (e) { /* 忽略配额问题 */ }
         },
 
@@ -4578,6 +4820,70 @@ ${warn}
     };
 
     /* ======================================================================
+     * 6.16 拖拽移动（落点校验与 DnD 状态）
+     *      拖拽的事件层很薄，真正要保证的是「哪些落点合法」：
+     *      ① 不能移到当前目录（无意义）
+     *      ② 不能把目录移到它自己
+     *      ③ 不能把目录移到它自己的子目录（会形成环，官方接口不会拦）
+     *      第 ③ 条只能靠路径判断：优先用本地索引反查目标的祖先链；索引不全
+     *      时退化为「目标是当前目录的直接子项」或「目标在当前面包屑路径上」
+     *      两种可证明安全的情形，其余一律拒绝并说明原因。
+     * ==================================================================== */
+
+    const DRAG_REASON = {
+        'no-drag': '没有正在拖动的项目',
+        'no-target': '目标目录无效',
+        'same-dir': '目标就是当前目录，无需移动',
+        'self': '不能把项目移动到它自己',
+        cycle: '不能把文件夹移动到它自己的子目录里',
+        'unknown-path': '无法确认目标位置（本地索引不足），请先进入该目录再移动',
+    };
+
+    const dragDrop = {
+        state: { active: false, items: [], srcCwd: '' },
+
+        /** 开始拖拽：拖动已选中项时带上整个选中集，否则只拖当前行 */
+        begin(item, picked = null) {
+            const list = Array.isArray(picked) && picked.length ? picked : [item];
+            this.state = { active: true, items: list.slice(), srcCwd: state.cwd };
+            return this.state.items;
+        },
+
+        end() { this.state = { active: false, items: [], srcCwd: '' }; },
+
+        /** 校验某个目录能否作为落点（供 dragover 实时反馈） */
+        inspect(targetFid) {
+            if (!this.state.active || !this.state.items.length) return { ok: false, reason: 'no-drag' };
+            return this.check(targetFid, this.state.items);
+        },
+
+        /** 纯校验逻辑（不依赖 DnD 事件，便于单测） */
+        check(targetFid, items) {
+            const target = String(targetFid || '');
+            if (!target) return { ok: false, reason: 'no-target' };
+            if (target === state.cwd) return { ok: false, reason: 'same-dir' };
+
+            const moving = (items || []).filter((i) => i && i.fid && i.fid !== target);
+            if (!moving.length) return { ok: false, reason: 'self' };
+
+            const dirs = moving.filter((i) => i.dir);
+            if (dirs.length) {
+                const res = finder.resolvePath(target);
+                const chain = new Set(res.path.map((s) => s.fid));
+                const hit = dirs.find((d) => chain.has(d.fid));
+                if (hit) return { ok: false, reason: 'cycle', name: hit.name };
+                if (!res.complete) {
+                    // 索引不全时只接受两种可证明安全的落点
+                    const isChild = state.items.some((i) => i.dir && i.fid === target);
+                    const onPath = state.path.some((s) => s.fid === target);
+                    if (!isChild && !onPath) return { ok: false, reason: 'unknown-path' };
+                }
+            }
+            return { ok: true, items: moving };
+        },
+    };
+
+    /* ======================================================================
      * 7. 运行态（当前目录 / 选中项 / 剪贴板）
      * ==================================================================== */
 
@@ -4759,6 +5065,21 @@ ${warn}
                     const b = document.createElement('button');
                     b.textContent = seg.name;
                     b.addEventListener('click', () => workspace.navTo(i));
+                    // 拖到面包屑＝移动到该级目录（往上移动永远不会成环）
+                    if (seg.fid !== state.cwd) {
+                        b.addEventListener('dragover', (e) => {
+                            if (!dragDrop.inspect(seg.fid).ok) return;
+                            e.preventDefault();
+                            b.classList.add('drop-target');
+                            if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+                        });
+                        b.addEventListener('dragleave', () => b.classList.remove('drop-target'));
+                        b.addEventListener('drop', async (e) => {
+                            e.preventDefault();
+                            b.classList.remove('drop-target');
+                            await workspace.dropTo(seg.fid);
+                        });
+                    }
                     crumb.appendChild(b);
                 });
 
@@ -4778,6 +5099,21 @@ ${warn}
                         btn.title = b.bad ? `「${b.name}」已不可访问（右键管理）` : `跳到「${b.name}」（右键管理）`;
                         btn.addEventListener('click', () => navBook.jump(b));
                         btn.addEventListener('contextmenu', (e) => { e.preventDefault(); navBook.open(); });
+                        // 拖到书签＝移动到该书签目录
+                        if (b.fid !== state.cwd) {
+                            btn.addEventListener('dragover', (e) => {
+                                if (!dragDrop.inspect(b.fid).ok) return;
+                                e.preventDefault();
+                                btn.classList.add('drop-target');
+                                if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+                            });
+                            btn.addEventListener('dragleave', () => btn.classList.remove('drop-target'));
+                            btn.addEventListener('drop', async (e) => {
+                                e.preventDefault();
+                                btn.classList.remove('drop-target');
+                                await workspace.dropTo(b.fid);
+                            });
+                        }
                         bookBar.appendChild(btn);
                     });
                     const mgr = document.createElement('button');
@@ -4973,6 +5309,40 @@ ${warn}
                         else if (config.get('clickAction', 'preview') === 'preview') preview.open(item);
                         else downloader.downloadSelection([item]);
                     });
+
+                    // —— 拖拽移动 ——
+                    tr.draggable = true;
+                    tr.addEventListener('dragstart', (e) => {
+                        const picked = workspace.beginDrag(item);
+                        tr.classList.add('dragging');
+                        if (e.dataTransfer) {
+                            e.dataTransfer.effectAllowed = 'move';
+                            try { e.dataTransfer.setData('text/plain', picked.map((i) => i.fid).join('\n')); } catch (err) { /* 忽略 */ }
+                        }
+                    });
+                    tr.addEventListener('dragend', () => {
+                        tr.classList.remove('dragging');
+                        workspace.endDrag();
+                    });
+                    if (item.dir) {
+                        tr.addEventListener('dragover', (e) => {
+                            const st = dragDrop.inspect(item.fid);
+                            if (!st.ok) {
+                                tr.classList.add('drop-denied');
+                                if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
+                                return;   // 不 preventDefault：浏览器会显示禁止图标
+                            }
+                            e.preventDefault();
+                            tr.classList.add('drop-target');
+                            if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+                        });
+                        tr.addEventListener('dragleave', () => tr.classList.remove('drop-target', 'drop-denied'));
+                        tr.addEventListener('drop', async (e) => {
+                            e.preventDefault();
+                            tr.classList.remove('drop-target', 'drop-denied');
+                            await workspace.dropTo(item.fid);
+                        });
+                    }
                 });
                 // 键盘游标行（↑↓ 导航时可见）
                 if (state.cursor >= 0 && state.cursor < trs.length) trs[state.cursor].classList.add('cur');
@@ -5184,38 +5554,90 @@ ${warn}
             } catch (e) { pr.close(); ui.toast('删除失败：' + e.message, 'error'); }
         },
 
-        async moveSelection() {
-            const items = sel.items();
-            if (!items.length) return ui.toast(t('noSelection'), 'warn');
-            const target = await picker.chooseFolder('选择目标文件夹');
-            if (target === null) return;
-            if (target === state.cwd) return ui.toast('目标目录就是当前目录，无需移动', 'warn');
+        /** 开始拖拽：拖动已选中项时带上整个选中集 */
+        beginDrag(item) {
+            const picked = sel.has(item.fid) ? sel.items() : [item];
+            dragDrop.begin(item, picked);
+            return picked;
+        },
+
+        endDrag() { dragDrop.end(); },
+
+        /** 拖到某个文件夹（事件层只调这里，核心在 dragDrop.check + moveItemsTo） */
+        async dropTo(targetFid) {
+            const items = dragDrop.state.items.slice();
+            dragDrop.end();
+            const chk = dragDrop.check(targetFid, items);
+            if (!chk.ok) {
+                ui.toast(DRAG_REASON[chk.reason] || '不能放到这里', 'warn', 4000);
+                return false;
+            }
+            return workspace.moveItemsTo(targetFid, chk.items, { via: '拖拽' });
+        },
+
+        /**
+         * 统一的「移动到指定目录」：工具栏选目标、拖拽、粘贴都走这里。
+         * 成功 → 操作历史（可撤销）；整批失败 → 失败账本（move 批次带目标目录，可重试）。
+         */
+        async moveItemsTo(target, items, { via = '移动' } = {}) {
+            const list = (items || []).filter((i) => i && i.fid && i.fid !== target);
+            if (!list.length) { ui.toast('没有可移动的项目', 'warn'); return false; }
+            if (target === state.cwd) { ui.toast('目标目录就是当前目录，无需移动', 'warn'); return false; }
             try {
-                // 同名冲突策略
-                const plan = await conflict.resolve(target, items, { label: '移动' });
-                if (plan.action === 'abort') return;
-                let moved = 0;
+                const plan = await conflict.resolve(target, list, { label: via });
+                if (plan.action === 'abort') return false;
+
                 if (plan.needRename.length) {
                     await api.renameMany(plan.needRename.map((r) => ({ fid: r.fid, file_name: r.file_name })));
                 }
                 const fids = plan.toMove.map((x) => x.fid);
-                if (fids.length) { await api.move(fids, target); moved = fids.length; }
-                const skippedNames = plan.skipped.map((s) => s.name);
+                let moved = 0;
+                if (fids.length) {
+                    try {
+                        await api.move(fids, target);
+                        moved = fids.length;
+                    } catch (e) {
+                        // 单次批量请求失败＝整批没动；记入失败账本，可在「失败记录」里重试
+                        failLog.push({
+                            action: 'move',
+                            label: `${via}失败`,
+                            meta: { toPdir: target },
+                            items: plan.toMove.map((x) => ({
+                                fid: x.fid, name: (x.item || {}).name || '', pdir: (x.item || {}).pdir_fid, error: e.message,
+                            })),
+                            note: plan.needRename.length ? `${plan.needRename.length} 项已改名，但移动未执行` : '',
+                        });
+                        throw e;
+                    }
+                }
                 opLog.push({
                     type: 'move',
-                    entries: plan.toMove.map((x) => ({ fid: x.fid, name: x.item.name, pdir: x.item.pdir_fid, toPdir: target })),
+                    label: via,
+                    entries: plan.toMove.map((x) => ({ fid: x.fid, name: (x.item || {}).name || '', pdir: (x.item || {}).pdir_fid, toPdir: target })),
                     undoable: moved > 0,
                     note: plan.skipped.length ? `已跳过 ${plan.skipped.length} 个同名项` : '',
                 });
                 if (!moved) {
                     ui.toast('全部项目因同名被跳过，未执行移动', 'warn', 4000);
-                } else if (skippedNames.length) {
-                    ui.toast(`已移动 ${moved} 项，跳过 ${skippedNames.length} 个同名项`, 'info', 4000);
+                } else if (plan.skipped.length) {
+                    ui.toast(`已移动 ${moved} 项，跳过 ${plan.skipped.length} 个同名项`, 'info', 4000);
                 } else {
                     ui.toast(`已移动 ${moved} 项`);
                 }
                 await workspace.reload();
-            } catch (e) { ui.toast('移动失败：' + e.message, 'error'); }
+                return moved > 0;
+            } catch (e) {
+                ui.toast(`${via}失败：` + e.message, 'error');
+                return false;
+            }
+        },
+
+        async moveSelection() {
+            const items = sel.items();
+            if (!items.length) return ui.toast(t('noSelection'), 'warn');
+            const target = await picker.chooseFolder('选择目标文件夹');
+            if (target === null) return;
+            await workspace.moveItemsTo(target, items, { via: '移动' });
         },
 
         /** 撤销最近一次操作（工具栏 / 快捷键） */
@@ -7423,6 +7845,7 @@ ${warn}
                     mk('空间占用分析', () => { p.close(); spaceReport.open(); });
                     mk('失败记录（查看 / 重试）', () => { p.close(); failLog.open(); });
                     mk('常用目录（书签 / 最近访问）', () => { p.close(); navBook.open(); });
+                    mk('账号与本机数据（隔离状态）', () => { p.close(); accountScope.open(); });
                     mk('跨账号迁移校验', () => { p.close(); crossCheck.exportFlow(); });
                     mk('清理目录级视图偏好', () => { viewPref.clearAll(); ui.toast('已清理'); });
                     mk('导入配置', () => {
@@ -7590,25 +8013,8 @@ ${warn}
                         const target = await picker.chooseFolder('粘贴到哪个文件夹');
                         if (target === null) return;
                         if (target === state.cwd) return ui.toast('目标目录就是当前目录，无需粘贴', 'warn');
-                        try {
-                            const plan = await conflict.resolve(target, cb.items, { label: '粘贴' });
-                            if (plan.action === 'abort') return;
-                            if (plan.needRename.length) {
-                                await api.renameMany(plan.needRename.map((r) => ({ fid: r.fid, file_name: r.file_name })));
-                            }
-                            const fids = plan.toMove.map((x) => x.fid);
-                            if (!fids.length) return ui.toast('全部项目因同名被跳过', 'warn');
-                            await api.move(fids, target);
-                            opLog.push({
-                                type: 'move',
-                                label: '粘贴（移动）',
-                                entries: plan.toMove.map((x) => ({ fid: x.fid, name: (x.item || {}).name || '', pdir: (x.item || {}).pdir_fid, toPdir: target })),
-                                note: plan.skipped.length ? `跳过 ${plan.skipped.length} 个同名项` : '',
-                            });
-                            ui.toast(`已粘贴 ${fids.length} 项` + (plan.skipped.length ? `，跳过 ${plan.skipped.length} 个同名项` : ''));
-                            if (cb.mode === 'cut') state.clipboard = { mode: null, items: [] };
-                            await workspace.reload();
-                        } catch (err) { ui.toast('粘贴失败：' + err.message, 'error'); }
+                        const done = await workspace.moveItemsTo(target, cb.items, { via: '粘贴（移动）' });
+                        if (done && cb.mode === 'cut') state.clipboard = { mode: null, items: [] };
                     },
                     [sc.undo]: () => workspace.undoLatest(),
                     [sc.history]: () => opLog.open(),
@@ -7713,6 +8119,7 @@ ${warn}
 
     function bootstrap() {
         config.load();
+        accountScope.loadCached();   // 先用上次识别结果，避免首屏数据写到错误作用域
         ui.ensureHost();
         bindMenu();
         shortcutMgr.bind();
@@ -7732,6 +8139,9 @@ ${warn}
             try { window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => ui.applyTheme()); } catch (e) { /* 旧内核忽略 */ }
         }
 
+        // 异步校正账号指纹（换号后刷新页面即可纠正；失败则沿用缓存）
+        accountScope.refresh();
+
         window.addEventListener('load', () => {
             fab.mount();
             if (!config.get('fab.hidden', false)) {
@@ -7750,7 +8160,7 @@ ${warn}
                 config, api, guard, breaker, EP, util, fileModel, scanner, indexCache, ui,
                 renameRules, parseSize, nameSimilarity,
                 opLog, conflict, capacityGuard, snapshot, cfgHistory, spaceReport, deleteWithUndo, crossCheck, viewPref,
-                workspace, finder, failLog, navBook, navTrail, dedup, cleanup, exporter, shareTool, trash, settings,
+                workspace, finder, failLog, navBook, navTrail, dragDrop, accountScope, dedup, cleanup, exporter, shareTool, trash, settings,
                 downloader, player, imgSearch, insight, preview, property, picker, state, sel,
                 fab, shortcutMgr,
             };

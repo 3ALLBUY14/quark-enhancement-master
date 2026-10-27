@@ -75,6 +75,7 @@ let renameFailsOn = [];        // 这些 fid 的重命名请求返回失败
 let deleteFailsOn = [];        // 命中这些 fid 的删除请求整片失败
 let listFailsOn = [];          // 这些 pdir 的列表请求返回失败（模拟目录已删除）
 let moveFailsOn = [];          // 目标目录命中这些 fid 的移动请求失败
+let memberUid = '';             // /member 返回的账号指纹（默认空＝未识别）
 // 缩略图占位（脱敏：纯色 SVG，非真实素材）
 const THUMB_DATA = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2240%22 height=%2240%22%3E%3Crect width=%2240%22 height=%2240%22 fill=%22%230067c0%22/%3E%3C/svg%3E';
 const FLAT = {};
@@ -143,7 +144,7 @@ function stubFetch(url, init) {
             md5: fid.startsWith('f_a') || fid.startsWith('f_b') ? 'MD5_SAME' : 'MD5_' + i,
         })));
     }
-    if (u.includes('/member')) return ok({ total_capacity: 6 * 1024 ** 4, use_capacity: 1024 ** 4, member_type: 'SVIP' });
+    if (u.includes('/member')) return ok({ total_capacity: 6 * 1024 ** 4, use_capacity: 1024 ** 4, member_type: 'SVIP', uid: memberUid });
     if (u.includes('/file/recycle/list')) {
         const list = recycleFixture || deleted.map((fid) => ({
             fid: 'rc_' + fid,
@@ -1859,6 +1860,162 @@ check('规则：非法字符被清理', () => !/[\\/:*?"<>|]/.test(Q.renameRules
         check('撤销取消：取消前的失败仍写入失败账本', () => expect(
             done2 === true && /部分撤销/.test(after2.note || '') && !!fb2 && fb2.items.length === 1,
             `备注=${after2 && after2.note} 失败项=${fb2 ? fb2.items.length : 0}`));
+    }
+
+    /* ---------------- 拖拽移动 / 搜索历史 / 账号隔离（v0.2.1） ---------------- */
+
+    {
+        // ① 落点校验：拒绝同目录 / 自身 / 环 / 位置不明；允许兄弟目录
+        await Q.workspace.reload('0');
+        const file = Q.state.items.find((i) => i.fid === 'f_a');
+        const dir = Q.state.items.find((i) => i.fid === 'd_1');
+
+        check('落点校验：目标为当前目录时拒绝', () => expect(
+            Q.dragDrop.check(Q.state.cwd, [file]).reason === 'same-dir'));
+        check('落点校验：把项目拖到它自己时拒绝', () => expect(
+            Q.dragDrop.check('d_1', [dir]).reason === 'self'));
+        check('落点校验：文件移到兄弟目录允许', () => expect(
+            Q.dragDrop.check('d_1', [file]).ok === true));
+        check('落点校验：位置无法确认时拒绝（索引不足）', () => {
+            const r = Q.dragDrop.check('d_unknown', [dir]);
+            return expect(r.ok === false && r.reason === 'unknown-path', JSON.stringify(r));
+        });
+
+        // 构造三级目录，验证「目录不能移进自己的子目录」
+        window.localStorage.setItem('qem_cache_idx_d_1', JSON.stringify({
+            at: Date.now(), items: [{ fid: 'd_x', name: '子目录', dir: true, pdir_fid: 'd_1', size: 0, updated_at: 1 }],
+        }));
+        Q.finder.invalidateIndex();
+        const cyc = Q.dragDrop.check('d_x', [dir]);
+        check('落点校验：目录移进自己的子目录被拒（防环）', () => expect(
+            cyc.ok === false && cyc.reason === 'cycle', JSON.stringify(cyc)));
+        window.localStorage.removeItem('qem_cache_idx_d_1');
+        Q.finder.invalidateIndex();
+    }
+
+    {
+        // ② 拖拽落地：成功记入操作历史；失败进失败账本且可重试
+        await Q.workspace.reload('0');
+        Q.breaker.reset();
+        moveFailsOn = [];
+        const file = Q.state.items.find((i) => i.fid === 'f_a');
+
+        Q.dragDrop.begin(file, [file]);
+        const ok1 = await Q.workspace.dropTo('d_1');
+        check('拖拽移动：到兄弟目录成功', () => expect(ok1 === true, `ok=${ok1}`));
+
+        const rec = Q.opLog.list()[0];
+        check('拖拽移动：记入操作历史且带目标目录（可撤销）', () => expect(
+            !!rec && rec.type === 'move' && rec.entries.length === 1 && rec.entries[0].toPdir === 'd_1',
+            JSON.stringify(rec && { label: rec.label, to: rec.entries[0] && rec.entries[0].toPdir })));
+
+        const mv = calls.filter((c) => c.url.includes('/file/move')).pop();
+        check('拖拽移动：调用移动接口并带上目标目录', () => {
+            const body = mv ? JSON.parse(mv.body) : {};
+            return expect(body.to_pdir_fid === 'd_1' && (body.filelist || []).length === 1, mv && mv.body);
+        });
+
+        // 拖到当前目录：拒绝且不发请求
+        const mvBefore = calls.filter((c) => c.url.includes('/file/move')).length;
+        Q.dragDrop.begin(file, [file]);
+        const ok2 = await Q.workspace.dropTo(Q.state.cwd);
+        check('拖拽移动：目标为当前目录时拒绝且不发请求', () => expect(
+            ok2 === false && calls.filter((c) => c.url.includes('/file/move')).length === mvBefore,
+            `ok=${ok2}`));
+
+        // 移动失败：进失败账本（带目标目录，可重试）
+        Q.breaker.reset();
+        Q.failLog.clear();
+        moveFailsOn = ['d_2'];
+        Q.dragDrop.begin(file, [file]);
+        const ok3 = await Q.workspace.dropTo('d_2');
+        moveFailsOn = [];
+        const fb = Q.failLog.list()[0];
+        check('拖拽移动失败：进入失败账本且可重试', () => expect(
+            ok3 === false && !!fb && fb.action === 'move' && fb.retryable === true
+            && fb.meta && fb.meta.toPdir === 'd_2',
+            JSON.stringify(fb && { action: fb.action, to: fb.meta && fb.meta.toPdir })));
+        Q.failLog.clear();
+
+        // 行上开启了可拖拽
+        check('拖拽移动：列表行可拖拽', () => expect(
+            Q.state.table.el.querySelector('tbody tr').draggable === true, '行未设置 draggable'));
+    }
+
+    {
+        // ③ 搜索历史：去重前移 / 上限 / 清空 / 搜索后自动记录
+        Q.finder.histClear();
+        Q.finder.histPush('电影');
+        Q.finder.histPush('教程');
+        Q.finder.histPush('电影');
+        check('搜索历史：同关键词去重前移', () => expect(
+            Q.finder.histList().length === 2 && Q.finder.histList()[0] === '电影',
+            JSON.stringify(Q.finder.histList())));
+
+        for (let i = 0; i < 15; i++) Q.finder.histPush('k' + i);
+        check('搜索历史：按上限裁剪', () => expect(
+            Q.finder.histList().length === Q.finder.MAX_HIST, `长度=${Q.finder.histList().length}`));
+
+        Q.finder.histClear();
+        check('搜索历史：可清空', () => expect(Q.finder.histList().length === 0));
+
+        // 全盘搜索后自动记录 + 面板展示
+        Q.finder.openGlobal('S01E01');
+        for (let i = 0; i < 30 && Q.finder.histList().length === 0; i++) await tick(60);
+        check('搜索历史：搜索后自动记录关键词', () => expect(
+            Q.finder.histList()[0] === 'S01E01', JSON.stringify(Q.finder.histList())));
+
+        const mask = lastMask();
+        const chips = mask ? Array.from(mask.querySelectorAll('.qem-books button')).map((b) => b.textContent) : [];
+        check('搜索历史：面板展示历史 chips', () => expect(chips.includes('S01E01'), JSON.stringify(chips)));
+        Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
+        await tick(40);
+    }
+
+    {
+        // ④ 账号隔离：识别到 uid 才隔离，识别不到就明说（不假装）
+        Q.accountScope.id = '';
+        check('账号隔离：未识别时键保持原样', () => expect(Q.accountScope.key('qem_x') === 'qem_x'));
+        check('账号隔离：未识别时不自称已隔离', () => expect(Q.accountScope.enabled() === false));
+
+        memberUid = 'u12345';
+        Q.breaker.reset();
+        Q.finder._idx = { at: Date.now(), map: new Map() };   // 造一个"旧作用域"的索引缓存
+        await Q.accountScope.refresh();
+        check('账号隔离：从 /member 识别 uid', () => expect(Q.accountScope.id === 'u12345', Q.accountScope.id));
+        check('账号隔离：作用域变化后作废旧路径索引', () => expect(
+            Q.finder._idx.at === 0, `at=${Q.finder._idx.at}`));
+        check('账号隔离：识别后键带作用域后缀', () => expect(
+            Q.accountScope.key('qem_x') === 'qem_x@u12345', Q.accountScope.key('qem_x')));
+
+        const plainBefore = window.localStorage.getItem('qem_bookmarks_v1');
+        Q.navBook.add({ fid: 'd_1', name: '隔离测试' });
+        check('账号隔离：书签写入带后缀的键（旧键不动）', () => expect(
+            !!window.localStorage.getItem('qem_bookmarks_v1@u12345')
+            && window.localStorage.getItem('qem_bookmarks_v1') === plainBefore,
+            '书签未按账号分库'));
+        Q.navBook.removeByFid('d_1');
+
+        // 手动迁移：复制无后缀旧数据，不删原键、不覆盖已有
+        window.localStorage.setItem('qem_ophistory_v1', JSON.stringify([{ id: 'old', type: 'rename', entries: [] }]));
+        window.localStorage.removeItem('qem_ophistory_v1@u12345');
+        const r1 = Q.accountScope.migrate();
+        check('账号隔离：迁移旧数据到当前作用域', () => expect(
+            r1.moved >= 1 && !!window.localStorage.getItem('qem_ophistory_v1@u12345'), JSON.stringify(r1)));
+        check('账号隔离：迁移不删除原数据', () => expect(
+            !!window.localStorage.getItem('qem_ophistory_v1')));
+        const r2 = Q.accountScope.migrate();
+        check('账号隔离：迁移不覆盖已存在的作用域数据', () => expect(
+            r2.moved === 0 && r2.skipped >= 1, JSON.stringify(r2)));
+
+        Q.config.set('accountScope', false);
+        check('账号隔离：关闭开关后键回到原样', () => expect(Q.accountScope.key('qem_x') === 'qem_x'));
+        Q.config.set('accountScope', true);
+
+        // 还原环境，避免影响后续用例
+        memberUid = '';
+        Q.accountScope.id = '';
+        window.localStorage.removeItem('qem_ophistory_v1');
     }
 
     /* ---------------- 结果 ---------------- */
