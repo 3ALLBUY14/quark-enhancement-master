@@ -3677,6 +3677,7 @@ ${warn}
                     return;
                 }
 
+                const hlParsed = finder.parse(kw);   // 每行都 parse 一次没必要，这里只算一遍
                 const tb = ui.table([
                     { key: 'name', label: '名称', render: (v, row) => {
                         const b = document.createElement('div');
@@ -3686,7 +3687,7 @@ ${warn}
                         const tx = document.createElement('span');
                         tx.className = 'txt';
                         tx.title = v;
-                        tx.innerHTML = finder.highlight(v, finder.parse(kw));
+                        tx.innerHTML = finder.highlight(v, hlParsed);
                         b.append(ic, tx);
                         return b;
                     } },
