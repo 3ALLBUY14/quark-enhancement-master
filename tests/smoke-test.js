@@ -73,6 +73,7 @@ let deleted = [];              // 模拟回收站：记录被删除的 fid
 let recycleFixture = null;     // 覆盖回收站返回（测试临期预警用）
 let renameFailsOn = [];        // 这些 fid 的重命名请求返回失败
 let deleteFailsOn = [];        // 命中这些 fid 的删除请求整片失败
+let listFailsOn = [];          // 这些 pdir 的列表请求返回失败（模拟目录已删除）
 // 缩略图占位（脱敏：纯色 SVG，非真实素材）
 const THUMB_DATA = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2240%22 height=%2240%22%3E%3Crect width=%2240%22 height=%2240%22 fill=%22%230067c0%22/%3E%3C/svg%3E';
 const FLAT = {};
@@ -88,6 +89,12 @@ function stubFetch(url, init) {
     if (u.includes('/file/sort')) {
         const m = /pdir_fid=([^&]*)/.exec(u);
         const fid = m ? decodeURIComponent(m[1]) : '0';
+        if (listFailsOn.includes(fid)) {
+            return Promise.resolve({
+                ok: true, status: 200,
+                json: () => Promise.resolve({ status: 500, code: 23010, message: '目录不存在或已删除' }),
+            });
+        }
         const list = FILES[fid] || [];
         return ok({ list }, { _total: list.length, _count: list.length, _page: 1 });
     }
@@ -1499,6 +1506,202 @@ check('规则：非法字符被清理', () => !/[\\/:*?"<>|]/.test(Q.renameRules
         const btn2 = Array.from(root.querySelectorAll('.qem-foot button')).find((b) => /项失败/.test(b.textContent));
         check('工作台底部：无失败时隐藏入口', () => expect(
             !btn2 || btn2.style.display === 'none', btn2 ? btn2.style.display : '未渲染'));
+    }
+
+    /* ---------------- 常用目录与导航历史（v0.1.9） ---------------- */
+
+    {
+        // ① 书签存储：去重 / 顺序 / 改名与失效标记 / 上限
+        window.localStorage.removeItem('qem_bookmarks_v1');
+        const r1 = Q.navBook.add({ fid: '0', name: '我的网盘' });
+        const r2 = Q.navBook.add({ fid: '0', name: '根目录改名' });
+        check('书签：同 fid 去重，只更新名称', () => expect(
+            r1.added && !r2.added && r2.reason === 'exists'
+            && Q.navBook.list().length === 1 && Q.navBook.list()[0].name === '根目录改名',
+            JSON.stringify(Q.navBook.list())));
+
+        Q.navBook.add({ fid: 'd_1', name: '影视' });
+        const b0 = Q.navBook.list()[0];
+        check('书签：可调整顺序', () => {
+            Q.navBook.move(b0.id, 1);
+            const arr = Q.navBook.list();
+            return expect(arr[1].fid === '0' && arr[0].fid === 'd_1', arr.map((x) => x.fid).join(','));
+        });
+
+        check('书签：可改名并标记失效', () => {
+            const b = Q.navBook.list().find((x) => x.fid === 'd_1');
+            Q.navBook.rename(b.id, '影视素材');
+            Q.navBook.markBad(b.id, true);
+            const nb = Q.navBook.list().find((x) => x.fid === 'd_1');
+            Q.navBook.markBad(b.id, false);
+            return expect(nb.name === '影视素材' && nb.bad === true && nb.badAt);
+        });
+
+        const oldMax = Q.navBook.MAX_BOOK;
+        Q.navBook.MAX_BOOK = 2;
+        const r3 = Q.navBook.add({ fid: 'd_2', name: '另一个' });
+        Q.navBook.MAX_BOOK = oldMax;
+        check('书签：达到上限时拒绝并给出原因', () => expect(!r3.added && r3.reason === 'limit'));
+
+        check('书签：toggle 已存在即取消', () => {
+            Q.navBook.removeByFid('d_1');
+            const a = Q.navBook.toggle({ fid: 'd_1', name: '影视' });
+            const b = Q.navBook.toggle({ fid: 'd_1', name: '影视' });
+            return expect(a.added && !b.added && b.reason === 'removed' && !Q.navBook.has('d_1'));
+        });
+    }
+
+    {
+        // ② 最近访问：去重前移 / 根目录不记 / 上限 / 清空
+        window.localStorage.removeItem('qem_recent_dirs_v1');
+        Q.navBook.touch({ fid: 'd_1', name: '影视' });
+        Q.navBook.touch({ fid: 'd_2', name: '影视2' });
+        Q.navBook.touch({ fid: 'd_1', name: '影视' });
+        check('最近访问：同 fid 前移去重', () => expect(
+            Q.navBook.recent().length === 2 && Q.navBook.recent()[0].fid === 'd_1',
+            JSON.stringify(Q.navBook.recent().map((r) => r.fid))));
+
+        Q.navBook.touch({ fid: '0', name: '我的网盘' });
+        check('最近访问：根目录不入记录', () => expect(Q.navBook.recent().length === 2));
+
+        const oldMax2 = Q.navBook.MAX_RECENT;
+        Q.navBook.MAX_RECENT = 2;
+        for (let i = 0; i < 4; i++) Q.navBook.touch({ fid: 'x' + i, name: 'x' + i });
+        Q.navBook.MAX_RECENT = oldMax2;
+        check('最近访问：按上限裁剪（保留最新）', () => expect(
+            Q.navBook.recent().length === 2 && Q.navBook.recent()[0].fid === 'x3',
+            JSON.stringify(Q.navBook.recent().map((r) => r.fid))));
+
+        Q.navBook.clearRecent();
+        check('最近访问：可清空', () => expect(Q.navBook.recent().length === 0));
+    }
+
+    {
+        // ③ 历史栈语义：同目录不入栈、peek 不移动、跳转后截断前方
+        Q.navTrail.reset();
+        const P = (fid, name) => [{ fid: '0', name: '我的网盘' }, { fid, name }];
+        Q.navTrail.push({ cwd: '0', path: [{ fid: '0', name: '我的网盘' }] });
+        Q.navTrail.push({ cwd: 'd_1', path: P('d_1', '影视') });
+        Q.navTrail.push({ cwd: 'd_1', path: P('d_1', '影视') });
+        check('历史栈：同目录不重复入栈', () => expect(Q.navTrail.stack.length === 2, `长度=${Q.navTrail.stack.length}`));
+        check('历史栈：可后退不可前进', () => expect(Q.navTrail.canBack() && !Q.navTrail.canForward()));
+
+        const pk = Q.navTrail.peek(-1);
+        check('历史栈：peek 只查看不移动索引', () => expect(
+            !!pk && pk.entry.cwd === '0' && Q.navTrail.idx === 1));
+
+        Q.navTrail.commit(pk.index);
+        check('历史栈：commit 后可前进', () => expect(
+            Q.navTrail.idx === 0 && Q.navTrail.canForward() && !Q.navTrail.canBack()));
+
+        Q.navTrail.push({ cwd: 'd_2', path: P('d_2', '影视2') });
+        check('历史栈：后退后新导航截断前方记录', () => expect(
+            Q.navTrail.stack.length === 2 && Q.navTrail.stack[1].cwd === 'd_2',
+            Q.navTrail.stack.map((x) => x.cwd).join(',')));
+        Q.navTrail.reset();
+    }
+
+    {
+        // ④ navigate / enter / goUp / back / forward 端到端
+        await Q.workspace.open();
+        await Q.workspace.navTo(0);
+        Q.navTrail.reset();
+        await Q.workspace.navTo(0);   // 以根目录作为历史基线
+
+        await Q.workspace.enter({ fid: 'd_1', name: '影视' });
+        check('进入目录：cwd 与面包屑一致', () => expect(
+            Q.state.cwd === 'd_1' && Q.state.path.length === 2 && Q.state.path[1].fid === 'd_1',
+            `cwd=${Q.state.cwd} 层级=${Q.state.path.length}`));
+        check('进入目录：自动记入最近访问', () => expect(
+            Q.navBook.recent()[0] && Q.navBook.recent()[0].fid === 'd_1'));
+
+        await Q.workspace.back();
+        check('后退：回到上一个目录', () => expect(
+            Q.state.cwd === '0' && Q.state.path.length === 1, `cwd=${Q.state.cwd}`));
+        check('后退：索引停在历史位置（可再前进）', () => expect(Q.navTrail.canForward()));
+
+        await Q.workspace.forward();
+        check('前进：回到子目录', () => expect(
+            Q.state.cwd === 'd_1' && Q.state.path.length === 2, `cwd=${Q.state.cwd}`));
+
+        await Q.workspace.goUp();
+        check('上一级：回到父目录', () => expect(Q.state.cwd === '0', `cwd=${Q.state.cwd}`));
+    }
+
+    {
+        // ⑤ 书签跳转：成功时还原完整面包屑；目标不可用时回滚并标记失效
+        await Q.workspace.navTo(0);
+        Q.navBook.add({ fid: 'd_1', name: '影视' });
+        const okBook = Q.navBook.list().find((b) => b.fid === 'd_1');
+        const okJump = await Q.navBook.jump(okBook);
+        check('书签跳转：成功并还原完整面包屑', () => expect(
+            okJump === true && Q.state.cwd === 'd_1'
+            && Q.state.path.map((x) => x.name).join('/') === '我的网盘/影视',
+            `ok=${okJump} path=${Q.state.path.map((x) => x.name).join('/')}`));
+
+        await Q.workspace.navTo(0);
+        Q.navBook.add({ fid: 'd_gone', name: '已删除的目录' });
+        const badBook = Q.navBook.list().find((b) => b.fid === 'd_gone');
+        listFailsOn = ['d_gone'];
+        const badJump = await Q.navBook.jump(badBook);
+        listFailsOn = [];
+        check('书签跳转失败：返回 false 并标记失效', () => expect(
+            badJump === false && Q.navBook.list().find((b) => b.fid === 'd_gone').bad === true));
+        check('书签跳转失败：目录与面包屑回滚', () => expect(
+            Q.state.cwd === '0' && Q.state.path.length === 1,
+            `cwd=${Q.state.cwd} 层级=${Q.state.path.length}`));
+        Q.navBook.removeByFid('d_gone');
+    }
+
+    {
+        // ⑥ 界面与快捷键：书签条高亮、点击跳转、Ctrl+D、Alt+←、Backspace
+        await Q.workspace.navTo(0);
+        await Q.workspace.enter({ fid: 'd_1', name: '影视' });
+        Q.navBook.add({ fid: 'd_1', name: '影视' });
+        Q.workspace.render();
+
+        const root = shadow();
+        const on = root.querySelector('.qem-books button.on');
+        check('书签条：渲染并以高亮标识当前目录', () => expect(
+            !!on && on.textContent === '影视',
+            `高亮=${on && on.textContent} 按钮数=${root.querySelectorAll('.qem-books button').length}`));
+
+        await Q.workspace.navTo(0);
+        Q.workspace.render();
+        const chip = Array.from(shadow().querySelectorAll('.qem-books button')).find((b) => b.textContent === '影视');
+        check('书签条：提供书签按钮', () => expect(!!chip, '未找到书签按钮'));
+        if (chip) chip.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+        await tick(220);
+        check('书签条：点击跳转到该书签目录', () => expect(Q.state.cwd === 'd_1', `cwd=${Q.state.cwd}`));
+
+        window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'd', ctrlKey: true, bubbles: true }));
+        check('Ctrl+D：取消收藏当前目录', () => expect(!Q.navBook.has('d_1')));
+        window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'd', ctrlKey: true, bubbles: true }));
+        check('Ctrl+D：再次按下重新收藏', () => expect(Q.navBook.has('d_1')));
+
+        window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'ArrowLeft', altKey: true, bubbles: true }));
+        await tick(220);
+        check('Alt+←：后退到上一个目录', () => expect(Q.state.cwd === '0', `cwd=${Q.state.cwd}`));
+
+        await Q.workspace.enter({ fid: 'd_1', name: '影视' });
+        window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
+        await tick(220);
+        check('Backspace：返回上一级', () => expect(Q.state.cwd === '0', `cwd=${Q.state.cwd}`));
+    }
+
+    {
+        // ⑦ 边界：工作台未打开时（从菜单/面板跳转）应自动打开，否则导航了却看不到界面
+        Q.navBook.add({ fid: 'd_1', name: '影视' });
+        const bk = Q.navBook.list().find((x) => x.fid === 'd_1');
+        Q.ui.panels.slice().forEach((x) => { try { x.close(); } catch (e) { /* 忽略 */ } });
+        await tick(60);
+        const wasClosed = !(Q.state.ui && Q.state.ui.el && Q.state.ui.el.isConnected);
+        const jumped = await Q.navBook.jump(bk);
+        check('菜单跳转：工作台未打开时自动打开并导航', () => expect(
+            wasClosed && jumped === true
+            && !!(Q.state.ui && Q.state.ui.el && Q.state.ui.el.isConnected)
+            && Q.state.cwd === 'd_1',
+            `关闭前=${wasClosed} 跳转=${jumped} cwd=${Q.state.cwd}`));
     }
 
     /* ---------------- 结果 ---------------- */

@@ -2,10 +2,10 @@
 // @name               夸克增强大师
 // @name:en            Quark Enhancement Master
 // @namespace          https://github.com/3ALLBUY14/quark-enhancement-master
-// @version            0.1.8
+// @version            0.1.9
 // @author             Quark port / 原版 PikPak Enhancement Master by digbug82
 // @license            AGPL-3.0-or-later
-// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、目录筛选与全盘搜索、键盘导航、失败明细与重试、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
+// @description        夸克网盘增强：批量操作可撤销、同名冲突策略、容量预检、熔断与缓存列表保护、目录快照差异对比、回收站临期预警、配置版本历史与回滚、空间占用分析、跨账号迁移校验、目录级视图偏好、目录筛选与全盘搜索、键盘导航、失败明细与重试、常用目录书签与前进后退、批量重命名、文件/文件夹查重、资源清理、目录树导出、M3U 导出、TXT 磁链提取、文件透视筛选、排序增强、直链导出与 Aria2/IDM 集成、PotPlayer 直达、批量分享与分享解析转存、回收站管理、以图搜图、配置备份。
 // @description:en     Quark Drive enhancement: batch rename, file/folder dedup, cleanup, directory-tree export, M3U export, magnet extraction, file insight/filter, sorting, direct-link export with Aria2/IDM, PotPlayer launcher, batch share & share-import, recycle bin, reverse image search, config backup.
 // @homepage           https://github.com/3ALLBUY14/quark-enhancement-master
 // @match              https://pan.quark.cn/*
@@ -60,7 +60,7 @@
      * 0. 常量
      * ==================================================================== */
 
-    const VERSION = '0.1.8';
+    const VERSION = '0.1.9';
     const LS_CFG = 'qem_cfg_v1';
     const LS_CACHE_PREFIX = 'qem_cache_';
     const ROOT_FID = '0';
@@ -749,6 +749,23 @@
 .qem-toolbar button.danger { color: var(--err); }
 .qem-toolbar button.danger:hover { background: var(--err-soft); border-color: var(--err); }
 .qem-sep { width: 1px; height: 22px; background: var(--bd-2); margin: 0 2px; flex: 0 0 auto; }
+
+/* —— 常用目录书签条 —— */
+.qem-books {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 5px 8px; background: var(--bg-1);
+  border: 1px solid var(--bd); border-radius: var(--r-lg);
+}
+.qem-books .lab { color: var(--warn); font-size: 12px; padding: 0 2px; }
+.qem-books button {
+  font-size: 12.5px; padding: 3px 9px;
+  max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.qem-books button.on { border-color: var(--pri-bd); background: var(--pri-soft); color: var(--pri); font-weight: 600; }
+.qem-books button.bad { color: var(--err); text-decoration: line-through; }
+.qem-books button.ghost { border-color: transparent; background: transparent; color: var(--fg-3); }
+.qem-books button.ghost:hover { background: var(--bg-2); color: var(--fg); }
+.qem-sec-title { font-size: 12px; font-weight: 600; color: var(--fg-2); margin: 12px 0 6px; }
 
 /* —— 搜索条（当前目录筛选 + 全盘搜索入口） —— */
 .qem-search {
@@ -4147,6 +4164,358 @@ ${warn}
     };
 
     /* ======================================================================
+     * 6.15 常用目录（书签 / 最近访问）与目录历史栈
+     *      导航此前只有面包屑一条路：每次都要从根目录一层层点进去，也不能
+     *      后退到上一个目录。这里补三层：
+     *      ① navBook：常用目录书签（手动收藏）+ 最近访问（自动记录）
+     *      ② navTrail：目录历史栈，支持前进/后退
+     *      ③ workspace.navigate：唯一的导航入口，失败回滚并标记失效书签
+     *      书签只存 fid + 名称，跳转时再向本地索引反查完整路径；
+     *      索引不全时退化为「根目录 + 书签」，保证至少能进到目标目录。
+     * ==================================================================== */
+
+    const BOOK_KEY = 'qem_bookmarks_v1';
+    const RECENT_KEY = 'qem_recent_dirs_v1';
+
+    const navBook = {
+        MAX_BOOK: 50,
+        MAX_RECENT: 12,
+
+        /* ---------- 书签 ---------- */
+        list() {
+            try {
+                const raw = localStorage.getItem(BOOK_KEY);
+                const arr = raw ? JSON.parse(raw) : [];
+                return Array.isArray(arr) ? arr.filter((b) => b && b.fid) : [];
+            } catch (e) { return []; }
+        },
+
+        persist(arr) {
+            try {
+                localStorage.setItem(BOOK_KEY, JSON.stringify((arr || []).slice(0, this.MAX_BOOK)));
+            } catch (e) { /* 配额满则放弃持久化，不影响本次会话 */ }
+        },
+
+        has(fid) { return this.list().some((b) => b.fid === String(fid)); },
+
+        /**
+         * 添加书签（同 fid 视为重复，只更新名称与时间，不新增条目）
+         * @returns {{added:boolean, name:string, reason?:string}}
+         */
+        add({ fid, name }) {
+            const id = String(fid || '');
+            const nm = String(name || '').trim() || '未命名目录';
+            if (!id) return { added: false, name: nm, reason: 'invalid' };
+            const arr = this.list();
+            const hit = arr.find((b) => b.fid === id);
+            if (hit) {
+                hit.name = nm;
+                hit.at = Date.now();
+                hit.bad = false;
+                this.persist(arr);
+                return { added: false, name: nm, reason: 'exists' };
+            }
+            if (arr.length >= this.MAX_BOOK) return { added: false, name: nm, reason: 'limit' };
+            arr.push({ id: 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), fid: id, name: nm, at: Date.now(), bad: false });
+            this.persist(arr);
+            return { added: true, name: nm };
+        },
+
+        /** 收藏 / 取消收藏（工具栏按钮与 Ctrl+D 用） */
+        toggle({ fid, name }) {
+            const id = String(fid || '');
+            if (!id) return { added: false, name: String(name || ''), reason: 'invalid' };
+            if (this.has(id)) {
+                this.removeByFid(id);
+                return { added: false, name: String(name || ''), reason: 'removed' };
+            }
+            return this.add({ fid: id, name });
+        },
+
+        remove(id) { this.persist(this.list().filter((b) => b.id !== id)); },
+        removeByFid(fid) { this.persist(this.list().filter((b) => b.fid !== String(fid))); },
+
+        rename(id, name) {
+            const nm = String(name || '').trim();
+            if (!nm) return false;
+            const arr = this.list();
+            const hit = arr.find((b) => b.id === id);
+            if (!hit) return false;
+            hit.name = nm;
+            this.persist(arr);
+            return true;
+        },
+
+        /** 调整顺序（delta=-1 上移 / +1 下移）；已在边界则不动 */
+        move(id, delta) {
+            const arr = this.list();
+            const i = arr.findIndex((b) => b.id === id);
+            if (i < 0) return false;
+            const j = i + delta;
+            if (j < 0 || j >= arr.length) return false;
+            const [item] = arr.splice(i, 1);
+            arr.splice(j, 0, item);
+            this.persist(arr);
+            return true;
+        },
+
+        /** 标记书签是否失效（目录已删除/被移动）。不自动删除，交由用户决定 */
+        markBad(id, bad = true) {
+            const arr = this.list();
+            const hit = arr.find((b) => b.id === id);
+            if (!hit) return false;
+            hit.bad = !!bad;
+            if (bad) hit.badAt = Date.now();
+            else delete hit.badAt;
+            this.persist(arr);
+            return true;
+        },
+
+        /* ---------- 最近访问 ---------- */
+        recent() {
+            try {
+                const raw = localStorage.getItem(RECENT_KEY);
+                const arr = raw ? JSON.parse(raw) : [];
+                return Array.isArray(arr) ? arr.filter((r) => r && r.fid) : [];
+            } catch (e) { return []; }
+        },
+
+        persistRecent(arr) {
+            try {
+                localStorage.setItem(RECENT_KEY, JSON.stringify((arr || []).slice(0, this.MAX_RECENT)));
+            } catch (e) { /* 忽略配额问题 */ }
+        },
+
+        /** 记录一次访问：同 fid 前移去重，超上限丢弃最旧 */
+        touch({ fid, name }) {
+            const id = String(fid || '');
+            if (!id || id === ROOT_FID) return;   // 根目录不记，没有导航价值
+            const arr = this.recent().filter((r) => r.fid !== id);
+            arr.unshift({ fid: id, name: String(name || '').trim() || '未命名目录', at: Date.now() });
+            this.persistRecent(arr);
+        },
+
+        clearRecent() { this.persistRecent([]); },
+
+        /* ---------- 跳转 ---------- */
+        /** 从菜单或面板跳转时工作台可能没开，先确保它打开，否则导航了却看不到界面 */
+        async ensurePanel() {
+            if (state.ui && state.ui.el && state.ui.el.isConnected) return;
+            await workspace.open();
+        },
+
+        /** 跳到书签：优先用本地索引还原完整面包屑，失败则标记失效并回滚 */
+        async jump(book) {
+            await this.ensurePanel();
+            const res = finder.resolvePath(book.fid);
+            const path = res.complete
+                ? res.path
+                : [{ fid: ROOT_FID, name: '我的网盘' }, { fid: book.fid, name: book.name }];
+            const ok = await workspace.navigate(book.fid, path);
+            if (!ok) {
+                this.markBad(book.id, true);
+                ui.toast(`「${book.name}」已不可访问（可能已被删除或移动），已标记为失效`, 'error', 5500);
+                if (workspace.render) workspace.render();
+                return false;
+            }
+            this.markBad(book.id, false);
+            this.touch({ fid: book.fid, name: book.name });
+            return true;
+        },
+
+        /* ---------- 面板 ---------- */
+        open() {
+            const p = ui.panel({
+                title: '常用目录', size: 'md',
+                buttons: [{ label: t('close'), onClick: (a) => a.close() }],
+            });
+            const tip = document.createElement('div');
+            tip.className = 'muted';
+            const bookTitle = document.createElement('div');
+            bookTitle.className = 'qem-sec-title';
+            bookTitle.textContent = '书签';
+            const bookBox = document.createElement('div');
+            bookBox.className = 'qem-content';
+            const recentTitle = document.createElement('div');
+            recentTitle.className = 'qem-sec-title';
+            recentTitle.textContent = '最近访问';
+            const recentBox = document.createElement('div');
+            recentBox.className = 'qem-content';
+            const acts = document.createElement('div');
+            acts.className = 'row';
+            acts.style.marginTop = '10px';
+            acts.style.flexWrap = 'wrap';
+            p.body.append(tip, bookTitle, bookBox, recentTitle, recentBox, acts);
+
+            const go = async (fid, name, bookId) => {
+                p.close();
+                if (bookId) await this.jump(this.list().find((b) => b.id === bookId) || { id: bookId, fid, name });
+                else {
+                    await this.ensurePanel();
+                    const res = finder.resolvePath(fid);
+                    const path = res.complete ? res.path : [{ fid: ROOT_FID, name: '我的网盘' }, { fid, name }];
+                    await workspace.navigate(fid, path);
+                    this.touch({ fid, name });
+                }
+            };
+
+            const render = () => {
+                const books = this.list();
+                const recents = this.recent();
+                tip.textContent = `书签 ${books.length} 个（上限 ${this.MAX_BOOK}）　·　最近访问 ${recents.length} 个（上限 ${this.MAX_RECENT}）`;
+
+                bookBox.innerHTML = '';
+                if (!books.length) {
+                    const e = document.createElement('div');
+                    e.className = 'qem-empty';
+                    e.textContent = '还没有书签。在工作台点「☆ 收藏」或按 Ctrl+D 收藏当前目录。';
+                    bookBox.appendChild(e);
+                } else {
+                    const tb = ui.table([
+                        { key: 'name', label: '名称', render: (v, row) => {
+                            const b = document.createElement('div');
+                            b.className = 'name';
+                            const ic = document.createElement('span');
+                            ic.textContent = row.fid === state.cwd ? '📂' : '📁';
+                            const tx = document.createElement('span');
+                            tx.className = 'txt';
+                            tx.textContent = v;
+                            tx.title = row.bad ? '该目录已不可访问' : v;
+                            b.append(ic, tx);
+                            if (row.bad) {
+                                const tag = document.createElement('span');
+                                tag.className = 'qem-tag err';
+                                tag.textContent = '失效';
+                                b.appendChild(tag);
+                            }
+                            return b;
+                        } },
+                        { key: 'at', label: '收藏时间', render: (v) => util.escapeHtml(util.ts(v)) },
+                        { key: 'act', label: '操作', render: (v, row, idx) => {
+                            const box = document.createElement('div');
+                            box.className = 'row';
+                            const mk2 = (label, cls, fn, disabled = false) => {
+                                const b = document.createElement('button');
+                                b.textContent = label;
+                                if (cls) b.className = cls;
+                                b.disabled = disabled;
+                                b.addEventListener('click', fn);
+                                box.appendChild(b);
+                                return b;
+                            };
+                            mk2('进入', 'primary', () => go(row.fid, row.name, row.id));
+                            mk2('↑', '', () => { this.move(row.id, -1); render(); }, idx === 0);
+                            mk2('↓', '', () => { this.move(row.id, 1); render(); }, idx === books.length - 1);
+                            mk2('改名', '', async () => {
+                                const nm = await ui.prompt('书签名称：', { value: row.name });
+                                if (!nm) return;
+                                this.rename(row.id, nm);
+                                render();
+                            });
+                            mk2('删除', 'danger', async () => {
+                                const ok = await ui.confirm(`删除书签「${row.name}」？仅删除书签，不影响网盘文件。`, { danger: true, okText: '删除' });
+                                if (!ok) return;
+                                this.remove(row.id);
+                                render();
+                            });
+                            return box;
+                        } },
+                    ], books.map((b, i) => ({ ...b, _i: i })), { maxHeight: '30vh' });
+                    bookBox.appendChild(tb.el);
+                }
+
+                recentBox.innerHTML = '';
+                if (!recents.length) {
+                    const e = document.createElement('div');
+                    e.className = 'qem-empty';
+                    e.textContent = '还没有最近访问记录。进入任意文件夹后会自动记录。';
+                    recentBox.appendChild(e);
+                } else {
+                    const tb = ui.table([
+                        { key: 'name', label: '名称', render: (v, row) => {
+                            const b = document.createElement('div');
+                            b.className = 'name';
+                            const ic = document.createElement('span');
+                            ic.textContent = '🕘';
+                            const tx = document.createElement('span');
+                            tx.className = 'txt';
+                            tx.textContent = v;
+                            tx.title = v;
+                            b.append(ic, tx);
+                            return b;
+                        } },
+                        { key: 'at', label: '最近访问', render: (v) => util.escapeHtml(util.ts(v)) },
+                        { key: 'act', label: '操作', render: (v, row) => {
+                            const b = document.createElement('button');
+                            b.textContent = '进入';
+                            b.addEventListener('click', () => go(row.fid, row.name));
+                            return b;
+                        } },
+                    ], recents, { maxHeight: '26vh' });
+                    recentBox.appendChild(tb.el);
+                }
+
+                acts.innerHTML = '';
+                const mkAct = (label, cls, fn) => {
+                    const b = document.createElement('button');
+                    b.textContent = label;
+                    if (cls) b.className = cls;
+                    b.addEventListener('click', fn);
+                    acts.appendChild(b);
+                    return b;
+                };
+                mkAct('收藏当前目录', 'primary', () => {
+                    const seg = state.path[state.path.length - 1];
+                    const r = this.add({ fid: state.cwd, name: seg ? seg.name : '' });
+                    if (r.reason === 'exists') ui.toast(`「${r.name}」已在书签中`, 'info');
+                    else if (r.reason === 'limit') ui.toast(`书签已达上限（${this.MAX_BOOK}），请先删除不用的`, 'warn', 4500);
+                    else ui.toast(`已收藏「${r.name}」`);
+                    render();
+                    if (workspace.render) workspace.render();
+                });
+                mkAct('清空最近访问', '', () => { this.clearRecent(); render(); });
+            };
+
+            render();
+        },
+    };
+
+    /**
+     * 目录历史栈：只在「导航」时入栈（刷新/重载不入栈），
+     * 后退后再打开新目录会截断前方记录（与浏览器行为一致）。
+     */
+    const navTrail = {
+        stack: [],
+        idx: -1,
+        MAX: 50,
+
+        reset() { this.stack = []; this.idx = -1; },
+
+        push(entry) {
+            const cur = this.stack[this.idx];
+            if (cur && cur.cwd === entry.cwd) return;   // 同目录不重复入栈
+            this.stack = this.stack.slice(0, this.idx + 1);
+            this.stack.push({
+                cwd: entry.cwd,
+                path: (entry.path || []).map((s) => ({ fid: s.fid, name: s.name })),
+            });
+            if (this.stack.length > this.MAX) this.stack.shift();
+            this.idx = this.stack.length - 1;
+        },
+
+        /** 只查看不移动；返回 { index, entry } */
+        peek(delta) {
+            const i = this.idx + delta;
+            if (i < 0 || i >= this.stack.length) return null;
+            return { index: i, entry: this.stack[i] };
+        },
+
+        commit(index) { this.idx = index; },
+        canBack() { return this.idx > 0; },
+        canForward() { return this.idx >= 0 && this.idx < this.stack.length - 1; },
+    };
+
+    /* ======================================================================
      * 7. 运行态（当前目录 / 选中项 / 剪贴板）
      * ==================================================================== */
 
@@ -4217,6 +4586,11 @@ ${warn}
             bar.style.marginBottom = '10px';
             const crumb = document.createElement('div');
             crumb.className = 'qem-crumb';
+
+            // 常用目录书签条（仅有书签时出现）
+            const bookBar = document.createElement('div');
+            bookBar.className = 'qem-books';
+            bookBar.style.display = 'none';
 
             // 搜索条：输入即筛（纯本地，不发请求）；回车走全盘搜索
             const searchBar = document.createElement('div');
@@ -4289,7 +4663,7 @@ ${warn}
 
             const tools = document.createElement('div');
             tools.className = 'qem-toolbar';
-            bar.append(crumb, searchBar, tools);
+            bar.append(crumb, bookBar, searchBar, tools);
             p.body.appendChild(bar);
 
             const listBox = document.createElement('div');
@@ -4325,6 +4699,32 @@ ${warn}
                     b.addEventListener('click', () => workspace.navTo(i));
                     crumb.appendChild(b);
                 });
+
+                // 书签条：点一下直接跳；右键打开管理面板
+                const books = navBook.list();
+                bookBar.innerHTML = '';
+                bookBar.style.display = books.length ? '' : 'none';
+                if (books.length) {
+                    const lab = document.createElement('span');
+                    lab.className = 'lab';
+                    lab.textContent = '★';
+                    bookBar.appendChild(lab);
+                    books.forEach((b) => {
+                        const btn = document.createElement('button');
+                        btn.textContent = b.name;
+                        btn.className = [b.fid === state.cwd ? 'on' : '', b.bad ? 'bad' : ''].filter(Boolean).join(' ');
+                        btn.title = b.bad ? `「${b.name}」已不可访问（右键管理）` : `跳到「${b.name}」（右键管理）`;
+                        btn.addEventListener('click', () => navBook.jump(b));
+                        btn.addEventListener('contextmenu', (e) => { e.preventDefault(); navBook.open(); });
+                        bookBar.appendChild(btn);
+                    });
+                    const mgr = document.createElement('button');
+                    mgr.className = 'ghost';
+                    mgr.textContent = '管理';
+                    mgr.addEventListener('click', () => navBook.open());
+                    bookBar.appendChild(mgr);
+                }
+
                 // 工具按钮
                 tools.innerHTML = '';
                 const mk = (label, fn, cls, tip) => {
@@ -4344,7 +4744,15 @@ ${warn}
                     d.className = 'qem-sep';
                     tools.appendChild(d);
                 };
-                // ① 目录
+                // ① 导航与目录
+                const histBack = mk('◀ 后退', () => workspace.back(), '', '后退到上一个目录（Alt+← / 鼠标侧键）');
+                histBack.disabled = !navTrail.canBack();
+                const histFwd = mk('前进 ▶', () => workspace.forward(), '', '前进到下一个目录（Alt+→ / 鼠标侧键）');
+                histFwd.disabled = !navTrail.canForward();
+                const upBtn = mk('↑ 上一级', () => workspace.goUp(), '', '返回上一级（Backspace）');
+                upBtn.disabled = state.path.length <= 1;
+                mk((navBook.has(state.cwd) ? '★' : '☆') + ' 收藏', () => workspace.toggleBookmark(), '',
+                    navBook.has(state.cwd) ? '取消收藏当前目录（Ctrl+D）' : '收藏当前目录（Ctrl+D）');
                 mk('⟳ ' + t('refresh'), () => workspace.reload());
                 mk('📁 ' + t('btnNewFolder'), () => workspace.newFolder());
                 sep();
@@ -4596,6 +5004,7 @@ ${warn}
             state.anchor = null;
             sel.clear();
             if (workspace.render) workspace.render();
+            let ok = true;
             try {
                 const r = await api.listAll(state.cwd, { max: 4000, onProgress: (n, total) => {
                     if (workspace.render) workspace.render();
@@ -4605,6 +5014,7 @@ ${warn}
                 indexCache.write(state.cwd, r.items);
                 finder.invalidateIndex();
             } catch (e) {
+                ok = false;
                 // 缓存列表保护：接口异常时不让列表变空，避免用户误判为文件丢失
                 const cached = indexCache.read(state.cwd);
                 if (cached && cached.items.length) {
@@ -4619,22 +5029,73 @@ ${warn}
                 state.loading = false;
                 if (workspace.render) workspace.render();
             }
+            return ok;
+        },
+
+        /**
+         * 统一导航入口：先改面包屑 → 载入 → 失败回滚。
+         * 目标目录不可用（已删除/无权限）时不能留下错位的面包屑。
+         * @param {boolean} record 是否记入历史栈（前进/后退时不记）
+         * @returns {Promise<boolean>}
+         */
+        async navigate(cwd, path, { record = true } = {}) {
+            const prev = { cwd: state.cwd, path: state.path.map((x) => ({ ...x })) };
+            state.path = (path || []).map((x) => ({ fid: x.fid, name: x.name }));
+            const ok = await workspace.reload(cwd);
+            if (!ok) {
+                state.cwd = prev.cwd;
+                state.path = prev.path;
+                await workspace.reload(prev.cwd);   // 回到原目录内容，避免列表与面包屑不一致
+                return false;
+            }
+            if (record) navTrail.push({ cwd: state.cwd, path: state.path });
+            return true;
+        },
+
+        /** 后退到上一个目录 */
+        async back() {
+            const p = navTrail.peek(-1);
+            if (!p) return ui.toast('已经是最初的目录', 'warn');
+            const ok = await workspace.navigate(p.entry.cwd, p.entry.path, { record: false });
+            if (ok) navTrail.commit(p.index);
+            else ui.toast('后退失败，该目录可能已不可用', 'error', 4500);
+        },
+
+        /** 前进到下一个目录 */
+        async forward() {
+            const p = navTrail.peek(1);
+            if (!p) return ui.toast('没有可前进的目录', 'warn');
+            const ok = await workspace.navigate(p.entry.cwd, p.entry.path, { record: false });
+            if (ok) navTrail.commit(p.index);
+            else ui.toast('前进失败，该目录可能已不可用', 'error', 4500);
+        },
+
+        /** 收藏 / 取消收藏当前目录（工具栏与 Ctrl+D 共用） */
+        toggleBookmark() {
+            const seg = state.path[state.path.length - 1];
+            const r = navBook.toggle({ fid: state.cwd, name: seg ? seg.name : '' });
+            if (r.reason === 'limit') ui.toast(`书签已达上限（${navBook.MAX_BOOK}），请先在「常用目录」里删除不用的`, 'warn', 4500);
+            else if (r.reason === 'removed') ui.toast(`已取消收藏「${r.name}」`);
+            else if (r.reason === 'exists') ui.toast(`已经收藏过「${r.name}」`);
+            else ui.toast(`已收藏「${r.name}」`);
+            workspace.render();
         },
 
         async enter(item) {
-            state.path.push({ fid: item.fid, name: item.name });
-            await workspace.reload(item.fid);
+            const ok = await workspace.navigate(item.fid, state.path.concat([{ fid: item.fid, name: item.name }]));
+            if (ok) navBook.touch({ fid: item.fid, name: item.name });
         },
 
         async navTo(index) {
             const seg = state.path[index];
             if (!seg) return;
-            state.path = state.path.slice(0, index + 1);
-            await workspace.reload(seg.fid);
+            const ok = await workspace.navigate(seg.fid, state.path.slice(0, index + 1));
+            if (ok && index > 0) navBook.touch({ fid: seg.fid, name: seg.name });
         },
 
         async goUp() {
-            if (state.path.length > 1) await workspace.navTo(state.path.length - 2);
+            if (state.path.length <= 1) return ui.toast('已在最上层目录', 'warn');
+            await workspace.navTo(state.path.length - 2);
         },
 
         async newFolder() {
@@ -6893,6 +7354,7 @@ ${warn}
                     mk('配置版本历史', () => { p.close(); cfgHistory.open(); });
                     mk('空间占用分析', () => { p.close(); spaceReport.open(); });
                     mk('失败记录（查看 / 重试）', () => { p.close(); failLog.open(); });
+                    mk('常用目录（书签 / 最近访问）', () => { p.close(); navBook.open(); });
                     mk('跨账号迁移校验', () => { p.close(); crossCheck.exportFlow(); });
                     mk('清理目录级视图偏好', () => { viewPref.clearAll(); ui.toast('已清理'); });
                     mk('导入配置', () => {
@@ -7013,6 +7475,12 @@ ${warn}
                 // Ctrl+F：聚焦筛选框（固定行为，不占用自定义快捷键位）
                 if (combo === 'Ctrl+F') { e.preventDefault(); if (workspace.focusSearch) workspace.focusSearch(); return; }
 
+                // 目录导航（固定行为）
+                if (combo === 'Ctrl+D') { e.preventDefault(); workspace.toggleBookmark(); return; }
+                if (combo === 'Alt+ArrowLeft') { e.preventDefault(); workspace.back(); return; }
+                if (combo === 'Alt+ArrowRight') { e.preventDefault(); workspace.forward(); return; }
+                if (e.key === 'Backspace') { e.preventDefault(); workspace.goUp(); return; }
+
                 // 方向键导航：↑↓ 移动游标，Shift 连选，Home/End 首尾，Enter 打开
                 if (!e.ctrlKey && !e.altKey) {
                     const nav = {
@@ -7079,6 +7547,15 @@ ${warn}
                 };
                 const fn = actions[combo];
                 if (fn) { e.preventDefault(); fn(); }
+            }, true);
+
+            // 鼠标侧键：后退 / 前进（需面板打开，避免影响夸克页面本身）
+            document.addEventListener('mouseup', (e) => {
+                if (e.button !== 3 && e.button !== 4) return;
+                if (!(state.ui && state.ui.el && state.ui.el.isConnected)) return;
+                e.preventDefault();
+                if (e.button === 3) workspace.back();
+                else workspace.forward();
             }, true);
         },
     };
@@ -7156,6 +7633,7 @@ ${warn}
             GM_registerMenuCommand('我的分享', () => shareTool.myList());
             GM_registerMenuCommand('全盘搜索', () => finder.openGlobal());
             GM_registerMenuCommand('失败记录', () => failLog.open());
+            GM_registerMenuCommand('常用目录（书签 / 最近访问）', () => navBook.open());
             GM_registerMenuCommand('空间占用分析', () => spaceReport.open());
             GM_registerMenuCommand('跨账号校验：导出账号清单', () => crossCheck.exportFlow());
             GM_registerMenuCommand('跨账号校验：导入并比对', () => crossCheck.compareFlow());
@@ -7204,7 +7682,7 @@ ${warn}
                 config, api, guard, breaker, EP, util, fileModel, scanner, indexCache, ui,
                 renameRules, parseSize, nameSimilarity,
                 opLog, conflict, capacityGuard, snapshot, cfgHistory, spaceReport, deleteWithUndo, crossCheck, viewPref,
-                workspace, finder, failLog, dedup, cleanup, exporter, shareTool, trash, settings,
+                workspace, finder, failLog, navBook, navTrail, dedup, cleanup, exporter, shareTool, trash, settings,
                 downloader, player, imgSearch, insight, preview, property, picker, state, sel,
                 fab, shortcutMgr,
             };

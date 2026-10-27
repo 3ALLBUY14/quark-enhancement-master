@@ -121,7 +121,7 @@ ${css}
 <div class="pv-wrap">
 
   <div class="pv-sec">
-    <h2>工作台面板（页眉 / 面包屑 / 筛选条 / 分组工具栏 / 内容区 / 状态栏）</h2>
+    <h2>工作台面板（页眉 / 面包屑 / 常用目录条 / 筛选条 / 分组工具栏 / 内容区 / 状态栏）</h2>
     <div class="qem-scope" id="pv-scope">
       <div class="qem-panel qem-lg" style="width:100%;height:auto;max-width:1200px">
         <div class="qem-head">
@@ -135,6 +135,14 @@ ${css}
               <button>我的网盘</button><span class="sep">›</span>
               <button>影视素材</button><span class="sep">›</span>
               <button>2024 合集</button>
+            </div>
+            <div class="qem-books">
+              <span class="lab">★</span>
+              <button>影视素材</button>
+              <button class="on">2024 合集</button>
+              <button>待整理</button>
+              <button class="bad">已删除的目录</button>
+              <button class="ghost">管理</button>
             </div>
             <div class="qem-search on">
               <div class="box">
